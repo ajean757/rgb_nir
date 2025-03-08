@@ -9,7 +9,7 @@ import concurrent.futures
 import time
 
 CHIP = 'gpiochip0'
-LINE_OFFSET = 26
+LINE_OFFSET = 16
 
 chip = gpiod.Chip(CHIP)
 
@@ -104,7 +104,7 @@ def main():
     config_ir = picam0.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
 	lores={"size":(640, 480), "format": "RGB888"},
-	raw={"format": "R12_CSI2P", "size": (4056, 3040)}
+	raw={"unpacked": "R12", "size": (4056, 3040)}
     )
     picam0.configure(config_ir)
     picam1.configure(config_rgb)
