@@ -10,17 +10,18 @@ import concurrent.futures
 import time
 import spidev
 from PIL import Image
-from lib import LCD_2inch4
+from lib import LCD_2inch, LCD_2inch4
+import os
 
 
-# import debugpy
+import debugpy
 
-# # Ensure debugpy only starts once
-# if not debugpy.is_client_connected():
-#     debugpy.listen(("0.0.0.0", 5678))
-#     print("Waiting for debugger to attach...")
-#     debugpy.wait_for_client()  # Pause execution until VSCode attaches
-# print("Debugger attached. Running script...")
+# Ensure debugpy only starts once
+if not debugpy.is_client_connected():
+    debugpy.listen(("0.0.0.0", 5678))
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Pause execution until VSCode attaches
+print("Debugger attached. Running script...")
 
 
 
@@ -57,7 +58,6 @@ print("Waiting for button press on GPIO26 (detecting falling edge)...")
 # Threading executor and stop event for button listener
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 stop_event = threading.Event()
-
 
 # ---------------------------
 # Camera capture functions
@@ -122,6 +122,8 @@ def gpio_listener(cam0, cam1):
                         print("Button pressed! Capturing images...")
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         dir = "./imagestest"
+                        if not os.path.exists(dir):
+                            os.makedirs(dir)
                         rgb_jpeg_filename = f"{dir}/{timestamp}_rgb.jpg"
                         rgb_raw_filename  = f"{dir}/{timestamp}_rgb.dng"
                         ir_jpeg_filename  = f"{dir}/{timestamp}_ir.jpg"
@@ -155,7 +157,7 @@ def gpio_listener(cam0, cam1):
 # -------------------
 def main():
     # Initialize LCD
-    disp = LCD_2inch4.LCD_2inch4()
+    disp = LCD_2inch.LCD_2inch()
     disp.Init()
     disp.clear()
     disp.bl_DutyCycle(50)
@@ -168,16 +170,16 @@ def main():
 
     config_rgb = picam1.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
-        lores={"size": (640, 480), "format": "RGB888"},
+        lores={"size": (320, 240), "format": "RGB888"},
         raw={"format": "SBGGR12_CSI2P", "size": (4056, 3040)},
-        transform=Transform(vflip=True),
+        transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw()
     )
     config_ir = picam0.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
-        lores={"size": (640, 480), "format": "RGB888"},
+        lores={"size": (320, 240), "format": "RGB888"},
         raw={"format": "R12", "size": (4056, 3040)},
-        transform=Transform(vflip=True),
+        transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw()
     )
     picam0.configure(config_ir)
@@ -206,32 +208,29 @@ def main():
             frame0 = picam0.capture_array("lores")
             frame1 = picam1.capture_array("lores")
 
+            # Convert to BGR to RGB:
+            frame0_corrected = cv2.cvtColor(frame0, cv2.COLOR_BGR2RGB)
+            frame1_corrected = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
+
             # Resize each frame individually before combining to maintain aspect ratio
             # For 240x320 display, each image should be 240x160 (half the height)
-            frame0_pil = Image.fromarray(frame0, 'RGB')
-            frame1_pil = Image.fromarray(frame1, 'RGB')
-            
-            # Resize maintaining aspect ratio
-            frame0_resized = frame0_pil.resize((240, 320), Image.LANCZOS)
-            frame1_resized = frame1_pil.resize((240, 320), Image.LANCZOS)
-
-            frame0_resized = frame0_resized.rotate(90, expand=True)
-            frame1_resized = frame1_resized.rotate(90, expand=True)
+            frame0_pil = Image.fromarray(frame0_corrected, 'RGB')
+            frame1_pil = Image.fromarray(frame1_corrected, 'RGB')
 
             # Calculate crop coordinates to get center of images
             # For 240x320 images, get the center 160 vertical pixels
-            crop_top = (320 - 160) // 2  # 80
-            crop_height = 160
+            crop_sides = (320 - 160) // 2  # 80
+            crop_height = 240
 
             # Crop images to center 160 pixels vertically
-            frame0_cropped = frame0_resized.crop((0, crop_top, 240, crop_top + crop_height))
-            frame1_cropped = frame1_resized.crop((0, crop_top, 240, crop_top + crop_height))
+            frame0_cropped = frame0_pil.crop((crop_sides, 0, crop_height, crop_height))
+            frame1_cropped = frame1_pil.crop((crop_sides, 0, crop_height, crop_height))
             # Create a blank 240x320 canvas (white background)
-            combined_img = Image.new('RGB', (240, 320), color=(0, 0, 0))
+            combined_img = Image.new('RGB', (320, 240), color=(0, 0, 0))
             
             # Place the two images vertically on the canvas
             combined_img.paste(frame0_cropped, (0, 0))
-            combined_img.paste(frame1_cropped, (0, 160))
+            combined_img.paste(frame1_cropped, (160, 0))
 
             current_time = time.time()
             if shared_state.capture_notification and (current_time - shared_state.notification_start_time) < shared_state.notification_duration:
@@ -239,7 +238,7 @@ def main():
                 draw = ImageDraw.Draw(combined_img)
 
                 border_width = 5
-                draw.rectangle([(0, 0), (239, 319)], outline=(255, 0, 0), width=border_width)
+                draw.rectangle([(0, 0), (320, 240)], outline=(255, 0, 0), width=border_width)
                 # Try to use a larger font
                 try:
                     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
@@ -254,30 +253,23 @@ def main():
                 text_width = text_bbox[2] - text_bbox[0]
                 text_height = text_bbox[3] - text_bbox[1]
 
-                text_x = (240 - text_width) // 2
-                text_y = (320 - text_height) // 2
+                text_x = (320 - text_width) // 2
+                text_y = (240 - text_height) // 2
 
                 # Draw the text
-                temp_img = Image.new('RGBA', (320, 240), color=(0, 0, 0, 0))
-                draw_temp = ImageDraw.Draw(temp_img)
-                draw_temp.text((text_x, text_y), text, fill=(255, 255, 255, 255), direction='ltr', font=font)
-                rotated = temp_img.rotate(90, expand=True)
-                rotated = rotated.transpose(Image.FLIP_TOP_BOTTOM)
-                combined_img = combined_img.convert('RGBA')
-                combined_img = Image.alpha_composite(combined_img, rotated)
+                draw.text((text_x, text_y), text, fill=(255, 255, 255), font=font)
 
-                
+                # Draw a progress bar
                 elapsed = current_time - shared_state.notification_start_time
                 progress = elapsed / shared_state.notification_duration
                 bar_width = int(240 * (1 - progress))
-                draw.rectangle([(0, 315), (bar_width, 319)], fill=(0, 255, 0))
+                draw.rectangle([(0, 235), (bar_width, 240)], fill=(0, 255, 0))
             elif shared_state.capture_notification:
                 shared_state.capture_notification = False
 
             # Send to display
+            combined_img = combined_img.rotate(90, expand=True)
             disp.ShowImage(combined_img)
-
-            # Allow a short delay and key detection for graceful exit
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     except KeyboardInterrupt:
