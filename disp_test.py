@@ -8,9 +8,8 @@ from picamera2 import Picamera2
 from libcamera import Transform, ColorSpace
 import concurrent.futures
 import time
-import spidev
-from PIL import Image
-from lib import LCD_2inch, LCD_2inch4
+from PIL import Image, ImageDraw, ImageFont
+from lib import LCD_2inch
 import os
 
 
@@ -23,19 +22,15 @@ if not debugpy.is_client_connected():
     debugpy.wait_for_client()  # Pause execution until VSCode attaches
 print("Debugger attached. Running script...")
 
-
-
 # -----------------------------
 # Global definitions and setup
 # -----------------------------
-
 class SharedState:
     capture_notification = False
     notification_start_time = 0
-    notification_duration = 1.5  # Show notification for 1.5 seconds
+    notification_duration = 1  # Show notification for 1.5 seconds
 
 shared_state = SharedState()
-
 
 # Button setup on GPIO26
 BUTTON_OFFSET = 16
@@ -53,7 +48,7 @@ button_request = gpiod.request_lines(
         )
     }
 )
-print("Waiting for button press on GPIO26 (detecting falling edge)...")
+print("Waiting for button press on GPIO16 (detecting falling edge)...")
 
 # Threading executor and stop event for button listener
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -68,9 +63,9 @@ def capture_camera(cam, jpeg_filename, raw_filename):
 
     cam.capture_file(jpeg_filename)
     request = cam.capture_request()
-    metadata = request.get_metadata()  # Get debugging info
+    metadata = request.get_metadata()
 
-    if cam.camera_config and "raw" in cam.camera_config:  # Check if raw is configured
+    if cam.camera_config and "raw" in cam.camera_config:
         try:
             print(f"Saving RAW image: {raw_filename}")
             request.save_dng(raw_filename)
@@ -88,7 +83,7 @@ def capture_camera(cam, jpeg_filename, raw_filename):
 
 def gpio_listener(cam0, cam1):
     last_press_time = 0
-    debounce_time = 0.05  # Increase to 500ms (0.5 seconds)
+    debounce_time = 0.5  # Increase to 500ms (0.5 seconds)
     capture_in_progress = False
     
     while not stop_event.is_set():
@@ -115,9 +110,6 @@ def gpio_listener(cam0, cam1):
                         # Set flag to prevent further captures while processing
                         capture_in_progress = True
                         last_press_time = current_time
-                        
-                        # Clear any extra events BEFORE processing
-                        button_request.read_edge_events()
                         
                         print("Button pressed! Capturing images...")
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -151,110 +143,106 @@ def gpio_listener(cam0, cam1):
             time.sleep(0.5)
                 
 
-
 # -------------------
 # Main function loop
 # -------------------
 def main():
     # Initialize LCD
+    # Waveshare 2inch, 240x320 display
     disp = LCD_2inch.LCD_2inch()
     disp.Init()
     disp.clear()
     disp.bl_DutyCycle(50)
 
     # Set up cameras
-    picam0 = Picamera2(camera_num=0)
-    picam1 = Picamera2(camera_num=1)
+    picam_ir = Picamera2(camera_num=0)
+    picam_rgb = Picamera2(camera_num=1)
 
-    picam0.set_controls({"AwbEnable":False, "ColourGains": (0,0)})
+    picam_ir.set_controls({"AwbEnable":False, "ColourGains": (0,0)})
 
-    config_rgb = picam1.create_preview_configuration(
-        main={"size": (2028, 1520), "format": "RGB888"},
-        lores={"size": (320, 240), "format": "RGB888"},
-        raw={"format": "SBGGR12_CSI2P", "size": (4056, 3040)},
-        transform=Transform(vflip=True, hflip=True),
-        colour_space=ColorSpace.Raw()
-    )
-    config_ir = picam0.create_preview_configuration(
+    config_ir = picam_ir.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
         lores={"size": (320, 240), "format": "RGB888"},
         raw={"format": "R12", "size": (4056, 3040)},
         transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw()
     )
-    picam0.configure(config_ir)
-    picam1.configure(config_rgb)
-    
+    config_rgb = picam_rgb.create_preview_configuration(
+        main={"size": (2028, 1520), "format": "RGB888"},
+        lores={"size": (320, 240), "format": "RGB888"},
+        raw={"format": "SBGGR12_CSI2P", "size": (4056, 3040)},
+        transform=Transform(vflip=True, hflip=True),
+        colour_space=ColorSpace.Raw()
+    )
 
-    print(f"Cam 0 (IR) sensor format: {picam0.sensor_format}")
-    print(f"Cam1 (RGB) sensor format: {picam1.sensor_format}")
-    print(f"RGB Camera Properties: {picam1.camera_configuration()['raw']}")
-    print(f"IR Camera Properties: {picam0.camera_configuration()['raw']}")
+    picam_ir.configure(config_ir)
+    picam_rgb.configure(config_rgb)
+
+    print(f"Cam 0 (IR) sensor format: {picam_ir.sensor_format}")
+    print(f"Cam1 (RGB) sensor format: {picam_rgb.sensor_format}")
+    print(f"RGB Camera Properties: {picam_rgb.camera_configuration()['raw']}")
+    print(f"IR Camera Properties: {picam_ir.camera_configuration()['raw']}")
 
     # Start cameras
-    picam0.start()
-    picam1.start()
+    picam_ir.start()
+    picam_rgb.start()
 
     print("Press 'q' to quit the live feed loop...")
     
     # Start button listener thread
-    t0 = threading.Thread(target=gpio_listener, args=(picam0, picam1,))
-    t0.daemon = True  # Mark as daemon so it doesn't block shutdown
+    t0 = threading.Thread(target=gpio_listener, args=(picam_ir, picam_rgb,), daemon=True)
 
     try:
         t0.start()
         while True:
             # Capture low-resolution frames from each camera
-            frame0 = picam0.capture_array("lores")
-            frame1 = picam1.capture_array("lores")
+            frame_ir = picam_ir.capture_array("lores")
+            frame_rgb = picam_rgb.capture_array("lores")
 
             # Convert to BGR to RGB:
-            frame0_corrected = cv2.cvtColor(frame0, cv2.COLOR_BGR2RGB)
-            frame1_corrected = cv2.cvtColor(frame1, cv2.COLOR_BGR2RGB)
+            frame_ir_corrected = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2RGB)
+            frame_rgb_corrected = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
 
             # Resize each frame individually before combining to maintain aspect ratio
             # For 240x320 display, each image should be 240x160 (half the height)
-            frame0_pil = Image.fromarray(frame0_corrected, 'RGB')
-            frame1_pil = Image.fromarray(frame1_corrected, 'RGB')
+            frame_ir_pil = Image.fromarray(frame_ir_corrected, 'RGB')
+            frame_rgb_pil = Image.fromarray(frame_rgb_corrected, 'RGB')
 
             # Calculate crop coordinates to get center of images
             # For 240x320 images, get the center 160 vertical pixels
-            crop_sides = (320 - 160) // 2  # 80
-            crop_height = 240
+            crop_sides = frame_ir_pil.width // 4
+            crop_height = frame_ir_pil.height
 
             # Crop images to center 160 pixels vertically
-            frame0_cropped = frame0_pil.crop((crop_sides, 0, crop_height, crop_height))
-            frame1_cropped = frame1_pil.crop((crop_sides, 0, crop_height, crop_height))
+            frame_ir_cropped = frame_ir_pil.crop((crop_sides, 0, crop_height, crop_height))
+            frame_rgb_cropped = frame_rgb_pil.crop((crop_sides, 0, crop_height, crop_height))
             # Create a blank 240x320 canvas (white background)
-            combined_img = Image.new('RGB', (320, 240), color=(0, 0, 0))
+            combined_img = Image.new('RGB', (disp.height, disp.width), color=(0, 0, 0))
             
             # Place the two images vertically on the canvas
-            combined_img.paste(frame0_cropped, (0, 0))
-            combined_img.paste(frame1_cropped, (160, 0))
+            combined_img.paste(frame_rgb_cropped, (0, 0))
+            combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
 
             current_time = time.time()
             if shared_state.capture_notification and (current_time - shared_state.notification_start_time) < shared_state.notification_duration:
-                from PIL import ImageDraw, ImageFont
                 draw = ImageDraw.Draw(combined_img)
 
                 border_width = 5
-                draw.rectangle([(0, 0), (320, 240)], outline=(255, 0, 0), width=border_width)
-                # Try to use a larger font
+                draw.rectangle([(0, 0), (disp.height, disp.width)], outline=(255, 0, 0), width=border_width)
                 try:
                     font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
                 except:
-                    # Fallback to default font
                     font = ImageFont.load_default()
 
-                text = "Captured!"
+                text = "Capturing!"
 
                 # Calculate text dimensions for centering
                 text_bbox = draw.textbbox((0, 0), text,font=font)
                 text_width = text_bbox[2] - text_bbox[0]
                 text_height = text_bbox[3] - text_bbox[1]
 
-                text_x = (320 - text_width) // 2
-                text_y = (240 - text_height) // 2
+                text_x = (disp.height - text_width) // 2
+                text_y = (disp.width - text_height) // 2
 
                 # Draw the text
                 draw.text((text_x, text_y), text, fill=(255, 255, 255), font=font)
@@ -262,8 +250,8 @@ def main():
                 # Draw a progress bar
                 elapsed = current_time - shared_state.notification_start_time
                 progress = elapsed / shared_state.notification_duration
-                bar_width = int(240 * (1 - progress))
-                draw.rectangle([(0, 235), (bar_width, 240)], fill=(0, 255, 0))
+                bar_width = int(240 * ( progress))
+                draw.rectangle([(0, disp.width - border_width), (bar_width, disp.width)], fill=(0, 255, 0))
             elif shared_state.capture_notification:
                 shared_state.capture_notification = False
 
@@ -276,11 +264,11 @@ def main():
         pass
     finally:
         stop_event.set()
-        picam0.stop()
-        picam1.stop()
+        picam_ir.stop()
+        picam_rgb.stop()
         cv2.destroyAllWindows()
         disp.module_exit()
-        button_request.release()  # Release GPIO resources
+        button_request.release()
         print("Cleanup complete. Exiting...")
 
 if __name__ == "__main__":
