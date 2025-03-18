@@ -12,6 +12,10 @@ from PIL import Image, ImageDraw, ImageFont
 from lib import LCD_2inch
 import os
 
+SAVE_DIR = "./data"
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
+
 for key, value in os.environ.items():
     print(f"{key}={value}")
 
@@ -106,9 +110,7 @@ def gpio_listener(cam0, cam1):
                         
                         print("Button pressed! Capturing images...")
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        dir = "./images"
-                        if not os.path.exists(dir):
-                            os.makedirs(dir)
+                        dir = SAVE_DIR
                         rgb_jpeg_filename = f"{dir}/{timestamp}_rgb.jpg"
                         rgb_raw_filename  = f"{dir}/{timestamp}_rgb.dng"
                         ir_jpeg_filename  = f"{dir}/{timestamp}_ir.jpg"
@@ -151,22 +153,24 @@ def main():
     picam_ir = Picamera2(camera_num=0)
     picam_rgb = Picamera2(camera_num=1)
 
-    picam_ir.set_controls({"AwbEnable":False, "ColourGains": (0,0)})
+    picam_ir.set_controls({"AwbEnable":False, "ColourGains": (0.0,0.0)})
 
     config_ir = picam_ir.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
         lores={"size": (320, 240), "format": "RGB888"},
-        raw={"format": "R12", "size": (4056, 3040)},
+        raw={"format": "SRGGB12_CSI2P", "size": (4056, 3040)},
         transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw()
     )
     config_rgb = picam_rgb.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
         lores={"size": (320, 240), "format": "RGB888"},
-        raw={"format": "SBGGR12_CSI2P", "size": (4056, 3040)},
+        raw={"format": "SRGGB12_CSI2P", "size": (4056, 3040)},
         transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw()
     )
+
+
 
     picam_ir.configure(config_ir)
     picam_rgb.configure(config_rgb)
@@ -179,6 +183,7 @@ def main():
     # Start cameras
     picam_ir.start()
     picam_rgb.start()
+
 
     print("Press 'q' to quit the live feed loop...")
     
@@ -196,6 +201,13 @@ def main():
             frame_ir_corrected = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2RGB)
             frame_rgb_corrected = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
 
+            # Extract the red channel from the IR frame
+            r_channel = frame_ir_corrected.copy()
+            r_channel = frame_ir_corrected[:, :, 0]
+            r_channel = cv2.cvtColor(cv2.merge([r_channel, r_channel, r_channel]), cv2.COLOR_BGR2RGB)
+
+            # Use r_channel instead of frame_ir_corrected for display
+            frame_ir_corrected = r_channel
             # Resize each frame individually before combining to maintain aspect ratio
             # For 240x320 display, each image should be 240x160 (half the height)
             frame_ir_pil = Image.fromarray(frame_ir_corrected, 'RGB')
