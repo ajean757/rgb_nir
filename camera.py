@@ -5,14 +5,14 @@ from datetime import datetime, timedelta
 import cv2
 import numpy as np
 from picamera2 import Picamera2
-from libcamera import Transform, ColorSpace
+from libcamera import Transform, ColorSpace, controls
 import concurrent.futures
 import time
 from PIL import Image, ImageDraw, ImageFont
 from lib import LCD_2inch
 import os
 
-SAVE_DIR = "./data"
+SAVE_DIR = "./calib_data4"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
@@ -54,23 +54,14 @@ stop_event = threading.Event()
 # ---------------------------
 # Camera capture functions
 # ---------------------------
-def capture_camera(cam, jpeg_filename, raw_filename):
+def capture_camera(cam, jpeg_filename, raw_filename, barrier):
     """Capture JPEG + RAW from a single camera"""
+    barrier.wait()
     start_time = time.perf_counter()
-
-    cam.capture_file(jpeg_filename)
-    request = cam.capture_request()
+    request = cam.capture_sync_request()
+    request.save("main", jpeg_filename)
+    request.save_dng(raw_filename)
     metadata = request.get_metadata()
-
-    if cam.camera_config and "raw" in cam.camera_config:
-        try:
-            print(f"Saving RAW image: {raw_filename}")
-            request.save_dng(raw_filename)
-        except Exception as e:
-            print(f"ERROR saving RAW: {e}")
-    else:
-        print(f"WARNING: RAW stream is not configured for {raw_filename}")
-
     request.release()
     end_time = time.perf_counter()
     print(f"[{start_time:.6f}] Captured {jpeg_filename} on Camera {cam.camera_idx}")
@@ -80,7 +71,7 @@ def capture_camera(cam, jpeg_filename, raw_filename):
 
 def gpio_listener(cam0, cam1):
     last_press_time = 0
-    debounce_time = 0.5  # Increase to 500ms (0.5 seconds)
+    debounce_time = 1  # Increase to 500ms (0.5 seconds)
     capture_in_progress = False
     
     while not stop_event.is_set():
@@ -116,13 +107,31 @@ def gpio_listener(cam0, cam1):
                         ir_jpeg_filename  = f"{dir}/{timestamp}_ir.jpg"
                         ir_raw_filename   = f"{dir}/{timestamp}_ir.dng"
 
-                        ir_task = executor.submit(capture_camera, cam0, ir_jpeg_filename, ir_raw_filename)
-                        rgb_task = executor.submit(capture_camera, cam1, rgb_jpeg_filename, rgb_raw_filename)
+                        # barrier = threading.Barrier(2)
+                        # rgb_task = executor.submit(capture_camera, cam1, rgb_jpeg_filename, rgb_raw_filename, barrier)
+                        # ir_task = executor.submit(capture_camera, cam0, ir_jpeg_filename, ir_raw_filename, barrier)
 
-                        ir_timestamp = ir_task.result()
-                        rgb_timestamp = rgb_task.result()
-                        time_diff = abs(ir_timestamp - rgb_timestamp)
-                        print(f"Time difference between camera captures {time_diff:.6f} seconds")
+                        # rgb_timestamp = rgb_task.result()
+                        # ir_timestamp = ir_task.result()
+                        # time_diff = abs(ir_timestamp - rgb_timestamp)
+                        # print(f"Time difference between camera captures {time_diff:.6f} seconds")
+                        
+                        request_rgb = cam1.capture_sync_request()
+                        request_ir = cam0.capture_sync_request()
+
+                        request_rgb.save("main", rgb_jpeg_filename)
+                        request_rgb.save_dng(rgb_raw_filename)
+                        metadata_rgb = request_rgb.get_metadata()
+
+                        request_ir.save("main", ir_jpeg_filename)
+                        request_ir.save_dng(ir_raw_filename)
+                        metadata_ir = request_ir.get_metadata()
+
+                        request_rgb.release()
+                        request_ir.release()
+                        print(f"Metadata: {metadata_rgb}")
+                        print(f"Metadata: {metadata_ir}")
+                        print(f"SensorTimestamp difference in ms: {abs(metadata_ir['SensorTimestamp'] - metadata_rgb['SensorTimestamp']) / 1e6:.6f} ms")
                         
                         # send notification flag 
                         shared_state.capture_notification = True
@@ -137,6 +146,19 @@ def gpio_listener(cam0, cam1):
             print(f"Error in GPIO listener: {e}")
             time.sleep(0.5)
                 
+def P_controller(Kp: float = 0.05, setpoint: float = 0, measurement: float = 0, output_limits=(-10000, 10000)):
+    e = setpoint - measurement
+    P = Kp * e
+
+    output_value = P
+
+    # output and limit if output_limits set
+    lower, upper = output_limits
+    if (upper is not None) and (output_value > upper):
+        return upper
+    elif (lower is not None) and (output_value < lower):
+        return lower
+    return output_value
 
 # -------------------
 # Main function loop
@@ -158,19 +180,19 @@ def main():
     config_ir = picam_ir.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
         lores={"size": (320, 240), "format": "RGB888"},
-        raw={"format": "SRGGB12_CSI2P", "size": (4056, 3040)},
+        raw={"format": "SRGGB12_CSI2P", "size": (2028, 1520)},
         transform=Transform(vflip=True, hflip=True),
-        colour_space=ColorSpace.Raw()
+        colour_space=ColorSpace.Raw(),
+        controls={'FrameRate': 15.0, 'SyncMode': controls.rpi.SyncModeEnum.Client}
     )
     config_rgb = picam_rgb.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
         lores={"size": (320, 240), "format": "RGB888"},
-        raw={"format": "SRGGB12_CSI2P", "size": (4056, 3040)},
+        raw={"format": "SRGGB12_CSI2P", "size": (2028, 1520)},
         transform=Transform(vflip=True, hflip=True),
-        colour_space=ColorSpace.Raw()
+        colour_space=ColorSpace.Raw(),
+        controls= {'FrameRate': 15.0, 'SyncMode': controls.rpi.SyncModeEnum.Server}
     )
-
-
 
     picam_ir.configure(config_ir)
     picam_rgb.configure(config_rgb)
@@ -197,17 +219,35 @@ def main():
             frame_ir = picam_ir.capture_array("lores")
             frame_rgb = picam_rgb.capture_array("lores")
 
+            # metadata_picam2a = picam_ir.capture_metadata()
+            # metadata_picam2b = picam_rgb.capture_metadata()
+
+            # timestamp_picam2a = metadata_picam2a["SensorTimestamp"] / 1000  #  convert ns to µs because all other values are in µs
+            # timestamp_picam2b = metadata_picam2b["SensorTimestamp"] / 1000  #  convert ns to µs because all other values are in µs
+            # timestamp_delta = timestamp_picam2b - timestamp_picam2a
+
+            # controller_output_frameduration_delta = int(P_controller(0.05, 0, timestamp_delta, (-10000, 10000)))
+            # control_out_frameduration = int(metadata_picam2a["FrameDuration"] + controller_output_frameduration_delta)  # sync to a, so use that for ref
+
+            # # print("Cam A: SensorTimestamp: ", timestamp_picam2a, " FrameDuration: ", metadata_picam2a["FrameDuration"])
+            # # print("Cam B: SensorTimestamp: ", timestamp_picam2b, " FrameDuration: ", metadata_picam2b["FrameDuration"])
+            # # print("SensorTimestampDelta: ", round(timestamp_delta / 1000, 1), "ms")
+            # # print("FrameDurationDelta: ", controller_output_frameduration_delta, "new FrameDurationLimit: ", control_out_frameduration)
+
+            # # with picam_rgb.controls as ctrl:
+            # #     # set new FrameDurationLimits based on P_controller output.
+            # #     ctrl.FrameDurationLimits = (control_out_frameduration, control_out_frameduration)
+            # picam_rgb.set_controls({"FrameDurationLimits": (control_out_frameduration, control_out_frameduration)})
+            # # print(f"frame duration limits on rgb cam {picam_rgb.camera_controls['FrameDurationLimits']}")
+
             # Convert to BGR to RGB:
             frame_ir_corrected = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2RGB)
             frame_rgb_corrected = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
 
             # Extract the red channel from the IR frame
-            r_channel = frame_ir_corrected.copy()
             r_channel = frame_ir_corrected[:, :, 0]
-            r_channel = cv2.cvtColor(cv2.merge([r_channel, r_channel, r_channel]), cv2.COLOR_BGR2RGB)
+            frame_ir_corrected = cv2.cvtColor(cv2.merge([r_channel, r_channel, r_channel]), cv2.COLOR_BGR2RGB)
 
-            # Use r_channel instead of frame_ir_corrected for display
-            frame_ir_corrected = r_channel
             # Resize each frame individually before combining to maintain aspect ratio
             # For 240x320 display, each image should be 240x160 (half the height)
             frame_ir_pil = Image.fromarray(frame_ir_corrected, 'RGB')
