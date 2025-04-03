@@ -4,31 +4,21 @@ import glob
 import os
 import matplotlib.pyplot as plt
 
-# --- Step 1: Stereo Camera Calibration ---
-
 # Checkerboard parameters
-CHECKERBOARD = (10,7)  # adjust if using a different checkerboard
-square_size = 0.025  # meter (e.g., 25mm squares)
+CHECKERBOARD = (7,10)  # adjust if using a different checkerboard
+SQUARE_SIZE = 0.025  # meter (e.g., 25mm squares)
 
 # Termination criteria for corner subpixel refinement
-criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 # Load calibration images for each camera
-ir_images = [] # Right camera
-rgb_images = [] # Left camera
-directory = "./new_calib_data"
-for filename in os.listdir(directory):
-    if filename.endswith("_ir.jpg"):
-        ir_images.append(os.path.join(directory, filename))
-    elif filename.endswith("_rgb.jpg"):
-        rgb_images.append(os.path.join(directory, filename))
+directory = "./calib_data2"
+ir_images = glob.glob(f"{directory}/*_ir.jpg") # Right camera
+rgb_images = glob.glob(f"{directory}/*_rgb.jpg") # Left camera
 ir_images.sort()
 rgb_images.sort()
 print("IR images: ", ir_images)
 print("RGB images: ", rgb_images)
-images_left = rgb_images
-images_right = ir_images
-
 
 def calibrate_camera(image_paths, pattern_size, square_size):
     """
@@ -66,8 +56,8 @@ def calibrate_camera(image_paths, pattern_size, square_size):
             if img is None:
                 print(f"Warning: Failed to load image {image_path}")
                 continue
-                
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            #gray = img[:, :, 0]  # Use only the R channel
         except Exception as e:
             print(f"Error processing {image_path}: {e}")
             continue
@@ -80,8 +70,7 @@ def calibrate_camera(image_paths, pattern_size, square_size):
             print(f"  Found chessboard corners in {image_path}")
             
             # Refine corners
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-            corners_sub = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            corners_sub = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), CRITERIA)
             
             objpoints.append(objp)
             imgpoints.append(corners_sub)
@@ -100,34 +89,21 @@ def calibrate_camera(image_paths, pattern_size, square_size):
     ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
         objpoints, imgpoints, gray.shape[::-1], None, None
     )
+    print(gray.shape[::-1])
     print('rmse:', ret)
     print('camera matrix:\n', camera_matrix)
     print('distortion coeffs:', dist_coeffs)
     print('Rs:\n', rvecs)
     print('Ts:\n', tvecs)
+    mean_error = 0
+    for i in range(len(objpoints)):
+        imgpoints2, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
+        error = cv2.norm(imgpoints[i], imgpoints2, cv2.NORM_L2)/len(imgpoints2)
+        mean_error += error
+    
+    print( "total error: {}".format(mean_error/len(objpoints)) )
+
     return ret, camera_matrix, dist_coeffs, rvecs, tvecs
-
-
-def stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size):
-    """
-    Stereo rectification. Produces transformation matrices for undistortion and
-    rectification for both cameras.
-    """
-    # alpha=0 -> crop the image to only valid region
-    # alpha=1 -> no cropping (may have black borders)
-    R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
-        cm0, dist0,
-        cm1, dist1,
-        image_size,
-        R, T,
-        alpha=1
-    )
-
-    # Create undistortion/rectification maps
-    map1x, map1y = cv2.initUndistortRectifyMap(cm0, dist0, R1, P1, image_size, cv2.CV_32FC1)
-    map2x, map2y = cv2.initUndistortRectifyMap(cm1, dist1, R2, P2, image_size, cv2.CV_32FC1)
-
-    return (map1x, map1y), (map2x, map2y), Q
 
 
 def stereo_calibrate(cam0_pairs, cam1_pairs,
@@ -151,34 +127,33 @@ def stereo_calibrate(cam0_pairs, cam1_pairs,
     for f0, f1 in zip(cam0_pairs, cam1_pairs):
         # Load the images
         if isinstance(f0, str):
+            #img0 = cv2.imread(f0)
+            #img0 = img0[:, :, 2]
+            # plt.imshow(img0,  cmap='gray')
+            # plt.show()
             img0 = cv2.imread(f0, cv2.IMREAD_GRAYSCALE)
-        else:
-            img0 = f0
-            if len(img0.shape) == 3:
-                img0 = cv2.cvtColor(img0, cv2.COLOR_BGR2GRAY)
-
         if isinstance(f1, str):
+            #img1 = cv2.imread(f1)
+            #img1 = img1[:, :, 2]
+            # plt.imshow(img1,  cmap='gray')
+            # plt.show()
             img1 = cv2.imread(f1, cv2.IMREAD_GRAYSCALE)
-        else:
-            img1 = f1
-            if len(img1.shape) == 3:
-                img1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
 
         ret0, corners0 = cv2.findChessboardCorners(img0, pattern_size, None)
         ret1, corners1 = cv2.findChessboardCorners(img1, pattern_size, None)
 
         if ret0 and ret1:
             # Refine corners
-            corners0 = cv2.cornerSubPix(img0, corners0, (5, 5), (-1, -1),
-                                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
-            corners1 = cv2.cornerSubPix(img1, corners1, (5, 5), (-1, -1),
-                                        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001))
+            corners0 = cv2.cornerSubPix(img0, corners0, (11, 11), (-1, -1), CRITERIA)
+            corners1 = cv2.cornerSubPix(img1, corners1, (11, 11), (-1, -1), CRITERIA)
             objpoints.append(objp)
             imgpoints_left.append(corners0)
             imgpoints_right.append(corners1)
 
     # Stereo calibration
-    flags = cv2.CALIB_FIX_INTRINSIC
+    #flags = cv2.CALIB_FIX_INTRINSIC
+    #flags = 0
+    flags = cv2.CALIB_SAME_FOCAL_LENGTH | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_USE_INTRINSIC_GUESS
     # You might set flags = cv2.CALIB_FIX_INTRINSIC if you want to fix intrinsics from prior calibrations
     # Example: flags |= cv2.CALIB_FIX_INTRINSIC
 
@@ -211,7 +186,7 @@ def stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size):
         cm1, dist1,
         image_size,
         R, T,
-        alpha=1
+        alpha=0
     )
 
     # Create undistortion/rectification maps
@@ -220,20 +195,11 @@ def stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size):
 
     return (map1x, map1y), (map2x, map2y), Q
 
-def rectify_stereo_pair(img0, img1, map1x, map1y, map2x, map2y):
-    """
-    Takes a new stereo pair (img0, img1), rectifies them using the provided maps,
-    and returns the undistorted, rectified pair.
-    """
-    rect0 = cv2.remap(img0, map1x, map1y, cv2.INTER_LINEAR)
-    rect1 = cv2.remap(img1, map2x, map2y, cv2.INTER_LINEAR)
-    return rect0, rect1
-
     
-rgb_err, rgb_cam_matrix, rgb_cam_dist, rvecs_rgb, tvecs_rgb = calibrate_camera(rgb_images, CHECKERBOARD, square_size)
+rgb_err, rgb_cam_matrix, rgb_cam_dist, rvecs_rgb, tvecs_rgb = calibrate_camera(rgb_images, CHECKERBOARD, SQUARE_SIZE)
 print(f"RGB camera calibration successful, error: {rgb_err}")
 
-ir_err, ir_cam_matrix, ir_cam_dist, rvecs_ir, tvecs_ir = calibrate_camera(ir_images, CHECKERBOARD, square_size)
+ir_err, ir_cam_matrix, ir_cam_dist, rvecs_ir, tvecs_ir = calibrate_camera(ir_images, CHECKERBOARD, SQUARE_SIZE)
 print(f"IR camera calibration successful, error: {ir_err}")
 
 cm0, dist0, cm1, dist1, R, T, E, F = stereo_calibrate(
@@ -241,14 +207,15 @@ cm0, dist0, cm1, dist1, R, T, E, F = stereo_calibrate(
     rgb_images,  # matching pairs from camera1
     ir_cam_matrix, ir_cam_dist,
     rgb_cam_matrix, rgb_cam_dist,
-    CHECKERBOARD, square_size
+    CHECKERBOARD, SQUARE_SIZE
 )
-
 
 # After calibrating:
 # Usually the 'image_size' should match the resolution at which you did the calibration.
-image_size = (2028,1520)  # e.g. (1280, 720)
+image_size = (2028,1020)  # e.g. (1280, 720)
 (map1x, map1y), (map2x, map2y), Q = stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size)
 
-np.savez('calib.npz', map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y, Q=Q)
+np.savez('calib_data2.npz', map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y,
+          Q=Q, cm0=cm0, dist0=dist0, cm1=cm1, dist1=dist1,
+          R=R, T=T, E=E, F=F)
 
