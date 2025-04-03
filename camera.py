@@ -54,11 +54,11 @@ stop_event = threading.Event()
 # ---------------------------
 # Camera capture functions
 # ---------------------------
-def capture_camera(cam, jpeg_filename, raw_filename, barrier):
+def capture_camera(cam, jpeg_filename, raw_filename, future_time):
     """Capture JPEG + RAW from a single camera"""
-    barrier.wait()
+    #barrier.wait()
     start_time = time.perf_counter()
-    request = cam.capture_sync_request()
+    request = cam.capture_request(flush=future_time)
     request.save("main", jpeg_filename)
     request.save_dng(raw_filename)
     metadata = request.get_metadata()
@@ -67,7 +67,7 @@ def capture_camera(cam, jpeg_filename, raw_filename, barrier):
     print(f"[{start_time:.6f}] Captured {jpeg_filename} on Camera {cam.camera_idx}")
     print(f"[{end_time:.6f}] Capture duration: {end_time - start_time:.6f} seconds")
     print(f"Metadata: {metadata}")
-    return start_time
+    return metadata
 
 def gpio_listener(cam0, cam1):
     last_press_time = 0
@@ -116,23 +116,36 @@ def gpio_listener(cam0, cam1):
                         # time_diff = abs(ir_timestamp - rgb_timestamp)
                         # print(f"Time difference between camera captures {time_diff:.6f} seconds")
                         
-                        request_rgb = cam1.capture_sync_request()
-                        request_ir = cam0.capture_sync_request()
+                        sync = cam1.capture_sync_request()
+                        future_time = time.monotonic_ns() + 33_000_000  # 100 ms = 100,000,000 ns
 
-                        request_rgb.save("main", rgb_jpeg_filename)
-                        request_rgb.save_dng(rgb_raw_filename)
-                        metadata_rgb = request_rgb.get_metadata()
+                        rgb_task = executor.submit(capture_camera, cam1, rgb_jpeg_filename, rgb_raw_filename, future_time)
+                        ir_task = executor.submit(capture_camera, cam0, ir_jpeg_filename, ir_raw_filename, future_time)
 
-                        request_ir.save("main", ir_jpeg_filename)
-                        request_ir.save_dng(ir_raw_filename)
-                        metadata_ir = request_ir.get_metadata()
+                        # request_rgb = cam1.capture_request(flush=future_time)
+                        # request_ir = cam0.capture_request(flush=future_time)
 
-                        request_rgb.release()
-                        request_ir.release()
+                        # request_rgb.save("main", rgb_jpeg_filename)
+                        # request_rgb.save_dng(rgb_raw_filename)
+                        # metadata_rgb = request_rgb.get_metadata()
+
+                        # request_ir.save("main", ir_jpeg_filename)
+                        # request_ir.save_dng(ir_raw_filename)
+                        # metadata_ir = request_ir.get_metadata()
+
+                        # request_rgb.release()
+                        # request_ir.release()
+                        metadata_rgb = rgb_task.result()
+                        metadata_ir = ir_task.result()
+                        
+                        sync.release()
                         print(f"Metadata: {metadata_rgb}")
                         print(f"Metadata: {metadata_ir}")
                         print(f"SensorTimestamp difference in ms: {abs(metadata_ir['SensorTimestamp'] - metadata_rgb['SensorTimestamp']) / 1e6:.6f} ms")
-                        
+                        rgb_exposure_start_time = metadata_rgb['SensorTimestamp'] - 1000 * metadata_rgb['ExposureTime']
+                        ir_exposure_start_time = metadata_ir['SensorTimestamp'] - 1000 * metadata_ir['ExposureTime']
+                        print(f"difference in exposure start time in ms: {abs(ir_exposure_start_time - rgb_exposure_start_time) / 1e6:.6f} ms")
+                       
                         # send notification flag 
                         shared_state.capture_notification = True
                         shared_state.notification_start_time = time.time()
@@ -145,20 +158,7 @@ def gpio_listener(cam0, cam1):
         except Exception as e:
             print(f"Error in GPIO listener: {e}")
             time.sleep(0.5)
-                
-def P_controller(Kp: float = 0.05, setpoint: float = 0, measurement: float = 0, output_limits=(-10000, 10000)):
-    e = setpoint - measurement
-    P = Kp * e
 
-    output_value = P
-
-    # output and limit if output_limits set
-    lower, upper = output_limits
-    if (upper is not None) and (output_value > upper):
-        return upper
-    elif (lower is not None) and (output_value < lower):
-        return lower
-    return output_value
 
 # -------------------
 # Main function loop
@@ -218,27 +218,6 @@ def main():
             # Capture low-resolution frames from each camera
             frame_ir = picam_ir.capture_array("lores")
             frame_rgb = picam_rgb.capture_array("lores")
-
-            # metadata_picam2a = picam_ir.capture_metadata()
-            # metadata_picam2b = picam_rgb.capture_metadata()
-
-            # timestamp_picam2a = metadata_picam2a["SensorTimestamp"] / 1000  #  convert ns to µs because all other values are in µs
-            # timestamp_picam2b = metadata_picam2b["SensorTimestamp"] / 1000  #  convert ns to µs because all other values are in µs
-            # timestamp_delta = timestamp_picam2b - timestamp_picam2a
-
-            # controller_output_frameduration_delta = int(P_controller(0.05, 0, timestamp_delta, (-10000, 10000)))
-            # control_out_frameduration = int(metadata_picam2a["FrameDuration"] + controller_output_frameduration_delta)  # sync to a, so use that for ref
-
-            # # print("Cam A: SensorTimestamp: ", timestamp_picam2a, " FrameDuration: ", metadata_picam2a["FrameDuration"])
-            # # print("Cam B: SensorTimestamp: ", timestamp_picam2b, " FrameDuration: ", metadata_picam2b["FrameDuration"])
-            # # print("SensorTimestampDelta: ", round(timestamp_delta / 1000, 1), "ms")
-            # # print("FrameDurationDelta: ", controller_output_frameduration_delta, "new FrameDurationLimit: ", control_out_frameduration)
-
-            # # with picam_rgb.controls as ctrl:
-            # #     # set new FrameDurationLimits based on P_controller output.
-            # #     ctrl.FrameDurationLimits = (control_out_frameduration, control_out_frameduration)
-            # picam_rgb.set_controls({"FrameDurationLimits": (control_out_frameduration, control_out_frameduration)})
-            # # print(f"frame duration limits on rgb cam {picam_rgb.camera_controls['FrameDurationLimits']}")
 
             # Convert to BGR to RGB:
             frame_ir_corrected = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2RGB)
