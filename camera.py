@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from lib import LCD_2inch
 import os
 
-SAVE_DIR = "./calib_data4"
+SAVE_DIR = "./two_rgb"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
@@ -119,24 +119,24 @@ def gpio_listener(cam0, cam1):
                         sync = cam1.capture_sync_request()
                         future_time = time.monotonic_ns() + 33_000_000  # 100 ms = 100,000,000 ns
 
-                        rgb_task = executor.submit(capture_camera, cam1, rgb_jpeg_filename, rgb_raw_filename, future_time)
-                        ir_task = executor.submit(capture_camera, cam0, ir_jpeg_filename, ir_raw_filename, future_time)
+                        # rgb_task = executor.submit(capture_camera, cam1, rgb_jpeg_filename, rgb_raw_filename, future_time)
+                        # ir_task = executor.submit(capture_camera, cam0, ir_jpeg_filename, ir_raw_filename, future_time)
 
-                        # request_rgb = cam1.capture_request(flush=future_time)
-                        # request_ir = cam0.capture_request(flush=future_time)
+                        request_rgb = cam1.capture_request(flush=future_time)
+                        request_ir = cam0.capture_request(flush=future_time)
 
-                        # request_rgb.save("main", rgb_jpeg_filename)
-                        # request_rgb.save_dng(rgb_raw_filename)
-                        # metadata_rgb = request_rgb.get_metadata()
+                        request_rgb.save("main", rgb_jpeg_filename)
+                        request_rgb.save_dng(rgb_raw_filename)
+                        metadata_rgb = request_rgb.get_metadata()
 
-                        # request_ir.save("main", ir_jpeg_filename)
-                        # request_ir.save_dng(ir_raw_filename)
-                        # metadata_ir = request_ir.get_metadata()
+                        request_ir.save("main", ir_jpeg_filename)
+                        request_ir.save_dng(ir_raw_filename)
+                        metadata_ir = request_ir.get_metadata()
 
-                        # request_rgb.release()
-                        # request_ir.release()
-                        metadata_rgb = rgb_task.result()
-                        metadata_ir = ir_task.result()
+                        request_rgb.release()
+                        request_ir.release()
+                        # metadata_rgb = rgb_task.result()
+                        # metadata_ir = ir_task.result()
                         
                         sync.release()
                         print(f"Metadata: {metadata_rgb}")

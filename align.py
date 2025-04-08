@@ -12,9 +12,9 @@ SQUARE_SIZE = 0.025  # meter (e.g., 25mm squares)
 CRITERIA = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
 # Load calibration images for each camera
-directory = "./calib_data2"
-ir_images = glob.glob(f"{directory}/*_ir.jpg") # Right camera
-rgb_images = glob.glob(f"{directory}/*_rgb.jpg") # Left camera
+directory = "./two_rgb"
+ir_images = glob.glob(f"{directory}/*_ir.jpg") # Left camera
+rgb_images = glob.glob(f"{directory}/*_rgb.jpg") # Right camera
 ir_images.sort()
 rgb_images.sort()
 print("IR images: ", ir_images)
@@ -56,8 +56,8 @@ def calibrate_camera(image_paths, pattern_size, square_size):
             if img is None:
                 print(f"Warning: Failed to load image {image_path}")
                 continue
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            #gray = img[:, :, 0]  # Use only the R channel
+            # gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = img[:, :, 2]  # Use only the R channel
         except Exception as e:
             print(f"Error processing {image_path}: {e}")
             continue
@@ -85,9 +85,10 @@ def calibrate_camera(image_paths, pattern_size, square_size):
     if valid_images == 0:
         raise ValueError("No chessboard patterns were detected in any of the images. Cannot calibrate.")
     
+    flags = cv2.CALIB_RATIONAL_MODEL
     # Now calibrate
     ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-        objpoints, imgpoints, gray.shape[::-1], None, None
+        objpoints, imgpoints, gray.shape[::-1], None, None, flags = flags
     )
     print(gray.shape[::-1])
     print('rmse:', ret)
@@ -131,13 +132,16 @@ def stereo_calibrate(cam0_pairs, cam1_pairs,
             #img0 = img0[:, :, 2]
             # plt.imshow(img0,  cmap='gray')
             # plt.show()
-            img0 = cv2.imread(f0, cv2.IMREAD_GRAYSCALE)
+            # img0 = cv2.imread(f0, cv2.IMREAD_GRAYSCALE)
+            img0 = cv2.imread(f0)[:, :, 2]
+
         if isinstance(f1, str):
             #img1 = cv2.imread(f1)
             #img1 = img1[:, :, 2]
             # plt.imshow(img1,  cmap='gray')
             # plt.show()
-            img1 = cv2.imread(f1, cv2.IMREAD_GRAYSCALE)
+            # img1 = cv2.imread(f1, cv2.IMREAD_GRAYSCALE)
+            img1 = cv2.imread(f1)[:, :, 2]
 
         ret0, corners0 = cv2.findChessboardCorners(img0, pattern_size, None)
         ret1, corners1 = cv2.findChessboardCorners(img1, pattern_size, None)
@@ -151,12 +155,8 @@ def stereo_calibrate(cam0_pairs, cam1_pairs,
             imgpoints_right.append(corners1)
 
     # Stereo calibration
-    #flags = cv2.CALIB_FIX_INTRINSIC
-    #flags = 0
-    flags = cv2.CALIB_SAME_FOCAL_LENGTH | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_USE_INTRINSIC_GUESS
-    # You might set flags = cv2.CALIB_FIX_INTRINSIC if you want to fix intrinsics from prior calibrations
-    # Example: flags |= cv2.CALIB_FIX_INTRINSIC
-
+    # flags = cv2.CALIB_FIX_INTRINSIC
+    flags = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_RATIONAL_MODEL | cv2.CALIB_FIX_PRINCIPAL_POINT
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-6)
 
     ret, cm0, dist0, cm1, dist1, R, T, E, F = cv2.stereoCalibrate(
@@ -186,14 +186,15 @@ def stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size):
         cm1, dist1,
         image_size,
         R, T,
-        alpha=0
+        alpha=0,
+        flags=cv2.CALIB_ZERO_DISPARITY
     )
 
     # Create undistortion/rectification maps
     map1x, map1y = cv2.initUndistortRectifyMap(cm0, dist0, R1, P1, image_size, cv2.CV_32FC1)
     map2x, map2y = cv2.initUndistortRectifyMap(cm1, dist1, R2, P2, image_size, cv2.CV_32FC1)
 
-    return (map1x, map1y), (map2x, map2y), Q
+    return map1x, map1y, map2x, map2y, Q
 
     
 rgb_err, rgb_cam_matrix, rgb_cam_dist, rvecs_rgb, tvecs_rgb = calibrate_camera(rgb_images, CHECKERBOARD, SQUARE_SIZE)
@@ -212,10 +213,10 @@ cm0, dist0, cm1, dist1, R, T, E, F = stereo_calibrate(
 
 # After calibrating:
 # Usually the 'image_size' should match the resolution at which you did the calibration.
-image_size = (2028,1020)  # e.g. (1280, 720)
-(map1x, map1y), (map2x, map2y), Q = stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size)
+image_size = (2028,1520)  # e.g. (1280, 720)
+map1x, map1y, map2x, map2y, Q = stereo_rectify(cm0, dist0, cm1, dist1, R, T, image_size)
 
-np.savez('calib_data2.npz', map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y,
+np.savez('two_rgb.npz', map1x=map1x, map1y=map1y, map2x=map2x, map2y=map2y,
           Q=Q, cm0=cm0, dist0=dist0, cm1=cm1, dist1=dist1,
           R=R, T=T, E=E, F=F)
 
