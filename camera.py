@@ -11,6 +11,8 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 from lib import LCD_2inch
 import os
+from enum import Enum
+
 
 SAVE_DIR = "./two_rgb"
 if not os.path.exists(SAVE_DIR):
@@ -22,10 +24,16 @@ for key, value in os.environ.items():
 # -----------------------------
 # Global definitions and setup
 # -----------------------------
+class DisplayState(Enum):
+    SPLIT = 0
+    RGB_ONLY = 1
+    IR_ONLY = 2
+
 class SharedState:
     capture_notification = False
     notification_start_time = 0
     notification_duration = 1  # Show notification for 1.5 seconds
+    display_state = DisplayState.SPLIT  # Default state
 
 shared_state = SharedState()
 
@@ -159,7 +167,20 @@ def gpio_listener(cam0, cam1):
             print(f"Error in GPIO listener: {e}")
             time.sleep(0.5)
 
+def cycle_display_state():
+    current_state = shared_state.display_state
+    next_state = DisplayState((current_state.value + 1) % len(DisplayState))
+    shared_state.display_state = next_state
+    print(f"Switched to display state: {shared_state.display_state.name}")
 
+def keyboard_listener():
+    while not stop_event.is_set():
+        user_input = input("Press 'c' to cycle display state or 'q' to quit: ").strip().lower()
+        if user_input == 'c':
+            cycle_display_state()  # Cycle through display states
+        elif user_input == 'q':
+            stop_event.set()  # Signal the main loop to stop
+            print("Exiting...")
 # -------------------
 # Main function loop
 # -------------------
@@ -208,13 +229,15 @@ def main():
 
 
     print("Press 'q' to quit the live feed loop...")
-    
+
+    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    keyboard_thread.start()
     # Start button listener thread
     t0 = threading.Thread(target=gpio_listener, args=(picam_ir, picam_rgb,), daemon=True)
 
     try:
         t0.start()
-        while True:
+        while True and not stop_event.is_set():
             # Capture low-resolution frames from each camera
             frame_ir = picam_ir.capture_array("lores")
             frame_rgb = picam_rgb.capture_array("lores")
@@ -246,9 +269,13 @@ def main():
             # Create a blank 240x320 canvas (white background)
             combined_img = Image.new('RGB', (disp.height, disp.width), color=(0, 0, 0))
             
-            # Place the two images vertically on the canvas
-            combined_img.paste(frame_rgb_cropped, (0, 0))
-            combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
+            if shared_state.display_state == DisplayState.SPLIT:
+                combined_img.paste(frame_rgb_cropped, (0, 0))
+                combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
+            elif shared_state.display_state == DisplayState.RGB_ONLY:
+                combined_img.paste(frame_rgb_pil, (0, 0))
+            elif shared_state.display_state == DisplayState.IR_ONLY:
+                combined_img.paste(frame_ir_pil, (0, 0))
 
             # Draw focus value
             try:
