@@ -219,6 +219,9 @@ def main():
             frame_ir = picam_ir.capture_array("lores")
             frame_rgb = picam_rgb.capture_array("lores")
 
+            metadata_ir = picam_ir.capture_metadata()
+            metadata_rgb = picam_rgb.capture_metadata()
+
             # Convert to BGR to RGB:
             frame_ir_corrected = cv2.cvtColor(frame_ir, cv2.COLOR_BGR2RGB)
             frame_rgb_corrected = cv2.cvtColor(frame_rgb, cv2.COLOR_BGR2RGB)
@@ -246,6 +249,18 @@ def main():
             # Place the two images vertically on the canvas
             combined_img.paste(frame_rgb_cropped, (0, 0))
             combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
+
+            # Draw focus value
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+            except:
+                font = ImageFont.load_default()
+
+            ir_focus = f"{metadata_ir['FocusFoM']}"
+            rgb_focus = f"{metadata_rgb['FocusFoM']}"
+            draw = ImageDraw.Draw(combined_img)
+            draw.text((10, 10), f"RGB Focus: {rgb_focus}", fill=(57, 255, 20), font=font)
+            draw.text((170, 10), f"IR Focus: {ir_focus}", fill=(57, 255, 20), font=font)
 
             current_time = time.time()
             if shared_state.capture_notification and (current_time - shared_state.notification_start_time) < shared_state.notification_duration:
