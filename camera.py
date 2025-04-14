@@ -21,9 +21,6 @@ if not os.path.exists(SAVE_DIR):
 for key, value in os.environ.items():
     print(f"{key}={value}")
 
-# -----------------------------
-# Global definitions and setup
-# -----------------------------
 class DisplayState(Enum):
     SPLIT = 0
     RGB_ONLY = 1
@@ -32,39 +29,44 @@ class DisplayState(Enum):
 class SharedState:
     capture_notification = False
     notification_start_time = 0
-    notification_duration = 1  # Show notification for 1.5 seconds
-    display_state = DisplayState.SPLIT  # Default state
+    notification_duration = 1 # Seconds
+    display_state = DisplayState.SPLIT
 
 shared_state = SharedState()
 
-# Button setup on GPIO26
 BUTTON_OFFSET = 16
+SWITCH_VIEW_OFFSET = 26
 CHIP_NAME = "/dev/gpiochip0"
 
-# Create request for button with pull-up and edge detection
 button_request = gpiod.request_lines(
     CHIP_NAME,
     consumer="button-app",
     config={
         BUTTON_OFFSET: gpiod.LineSettings(
             direction=gpiod.line.Direction.INPUT,
-            edge_detection=gpiod.line.Edge.FALLING,
-            bias=gpiod.line.Bias.PULL_UP
+            edge_detection=gpiod.line.Edge.RISING,
+            bias=gpiod.line.Bias.PULL_DOWN
         )
     }
 )
-print("Waiting for button press on GPIO16 (detecting falling edge)...")
 
-# Threading executor and stop event for button listener
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+switch_view_request = gpiod.request_lines(
+    CHIP_NAME,
+    consumer="button-app",
+    config={
+        SWITCH_VIEW_OFFSET: gpiod.LineSettings(
+            direction=gpiod.line.Direction.INPUT,
+            edge_detection=gpiod.line.Edge.RISING,
+            bias=gpiod.line.Bias.PULL_DOWN
+        )
+    }
+)
+
+# executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
 stop_event = threading.Event()
 
-# ---------------------------
-# Camera capture functions
-# ---------------------------
 def capture_camera(cam, jpeg_filename, raw_filename, future_time):
     """Capture JPEG + RAW from a single camera"""
-    #barrier.wait()
     start_time = time.perf_counter()
     request = cam.capture_request(flush=future_time)
     request.save("main", jpeg_filename)
@@ -79,7 +81,7 @@ def capture_camera(cam, jpeg_filename, raw_filename, future_time):
 
 def gpio_listener(cam0, cam1):
     last_press_time = 0
-    debounce_time = 1  # Increase to 500ms (0.5 seconds)
+    debounce_time = 1
     capture_in_progress = False
     
     while not stop_event.is_set():
@@ -100,7 +102,7 @@ def gpio_listener(cam0, cam1):
                     
                     # Check if this is a valid button press (debounce)
                     if (event.line_offset == BUTTON_OFFSET and 
-                        event.event_type == gpiod.EdgeEvent.Type.FALLING_EDGE and
+                        event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE and
                         (current_time - last_press_time) > debounce_time):
                         
                         # Set flag to prevent further captures while processing
@@ -162,7 +164,16 @@ def gpio_listener(cam0, cam1):
                     else:
                         # Clear any additional events that came in during the debounce period
                         button_request.read_edge_events()
-        
+            
+            elif switch_view_request.wait_edge_events(timeout=timedelta(seconds=1)):
+                events = switch_view_request.read_edge_events(max_events=1)
+                if events:
+                    event = events[0]
+                    if (event.line_offset == SWITCH_VIEW_OFFSET and 
+                        event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE):
+                        print("Switching display state...")
+                        cycle_display_state()
+
         except Exception as e:
             print(f"Error in GPIO listener: {e}")
             time.sleep(0.5)
@@ -177,22 +188,18 @@ def keyboard_listener():
     while not stop_event.is_set():
         user_input = input("Press 'c' to cycle display state or 'q' to quit: ").strip().lower()
         if user_input == 'c':
-            cycle_display_state()  # Cycle through display states
+            cycle_display_state()
         elif user_input == 'q':
-            stop_event.set()  # Signal the main loop to stop
+            stop_event.set()
             print("Exiting...")
-# -------------------
-# Main function loop
-# -------------------
+
 def main():
-    # Initialize LCD
     # Waveshare 2inch, 240x320 display
     disp = LCD_2inch.LCD_2inch()
     disp.Init()
     disp.clear()
     disp.bl_DutyCycle(50)
 
-    # Set up cameras
     picam_ir = Picamera2(camera_num=0)
     picam_rgb = Picamera2(camera_num=1)
 
@@ -223,16 +230,14 @@ def main():
     print(f"RGB Camera Properties: {picam_rgb.camera_configuration()['raw']}")
     print(f"IR Camera Properties: {picam_ir.camera_configuration()['raw']}")
 
-    # Start cameras
     picam_ir.start()
     picam_rgb.start()
 
 
     print("Press 'q' to quit the live feed loop...")
 
-    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    keyboard_thread.start()
-    # Start button listener thread
+    # keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    # keyboard_thread.start()
     t0 = threading.Thread(target=gpio_listener, args=(picam_ir, picam_rgb,), daemon=True)
 
     try:
@@ -268,26 +273,27 @@ def main():
             frame_rgb_cropped = frame_rgb_pil.crop((crop_sides, 0, crop_height, crop_height))
             # Create a blank 240x320 canvas (white background)
             combined_img = Image.new('RGB', (disp.height, disp.width), color=(0, 0, 0))
-            
-            if shared_state.display_state == DisplayState.SPLIT:
-                combined_img.paste(frame_rgb_cropped, (0, 0))
-                combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
-            elif shared_state.display_state == DisplayState.RGB_ONLY:
-                combined_img.paste(frame_rgb_pil, (0, 0))
-            elif shared_state.display_state == DisplayState.IR_ONLY:
-                combined_img.paste(frame_ir_pil, (0, 0))
 
             # Draw focus value
             try:
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
             except:
                 font = ImageFont.load_default()
-
             ir_focus = f"{metadata_ir['FocusFoM']}"
             rgb_focus = f"{metadata_rgb['FocusFoM']}"
             draw = ImageDraw.Draw(combined_img)
-            draw.text((10, 10), f"RGB Focus: {rgb_focus}", fill=(57, 255, 20), font=font)
-            draw.text((170, 10), f"IR Focus: {ir_focus}", fill=(57, 255, 20), font=font)
+            
+            if shared_state.display_state == DisplayState.SPLIT:
+                combined_img.paste(frame_rgb_cropped, (0, 0))
+                combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
+                draw.text((10, 10), f"RGB Focus: {rgb_focus}", fill=(57, 255, 20), font=font)
+                draw.text((170, 10), f"IR Focus: {ir_focus}", fill=(57, 255, 20), font=font)
+            elif shared_state.display_state == DisplayState.RGB_ONLY:
+                combined_img.paste(frame_rgb_pil, (0, 0))
+                draw.text((10, 10), f"RGB Focus: {rgb_focus}", fill=(57, 255, 20), font=font)
+            elif shared_state.display_state == DisplayState.IR_ONLY:
+                combined_img.paste(frame_ir_pil, (0, 0))
+                draw.text((170, 10), f"IR Focus: {ir_focus}", fill=(57, 255, 20), font=font)
 
             current_time = time.time()
             if shared_state.capture_notification and (current_time - shared_state.notification_start_time) < shared_state.notification_duration:
@@ -324,8 +330,6 @@ def main():
             # Send to display
             combined_img = combined_img.rotate(90, expand=True)
             disp.ShowImage(combined_img)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
     except KeyboardInterrupt:
         pass
     finally:
