@@ -26,11 +26,13 @@ class DisplayState(Enum):
     RGB_ONLY = 1
     IR_ONLY = 2
 
+
 class SharedState:
     capture_notification = False
     notification_start_time = 0
     notification_duration = 1 # Seconds
     display_state = DisplayState.SPLIT
+    zoom = 1.0
 
 shared_state = SharedState()
 
@@ -184,6 +186,18 @@ def cycle_display_state():
     shared_state.display_state = next_state
     print(f"Switched to display state: {shared_state.display_state.name}")
 
+def apply_digital_zoom(frame, zoom_factor):
+    w, h = frame.size
+    new_w, new_h = int(w / zoom_factor), int(h / zoom_factor)
+
+    x1 = (w - new_w) // 2
+    y1 = (h - new_h) // 2
+    cropped = frame.crop((x1, y1, x1 + new_w, y1 + new_h))
+
+    zoomed = cropped.resize((w, h), resample=Image.BILINEAR)
+    return zoomed
+
+
 def keyboard_listener():
     while not stop_event.is_set():
         user_input = input("Press 'c' to cycle display state or 'q' to quit: ").strip().lower()
@@ -192,6 +206,12 @@ def keyboard_listener():
         elif user_input == 'q':
             stop_event.set()
             print("Exiting...")
+        elif user_input == '=':
+            shared_state.zoom += 0.1
+            print(f"Zoom increased to {shared_state.zoom:.1f}")
+        elif user_input == '-': 
+            shared_state.zoom -= 0.1
+            print(f"Zoom decreased to {shared_state.zoom:.1f}")
 
 def main():
     # Waveshare 2inch, 240x320 display
@@ -207,7 +227,7 @@ def main():
 
     config_ir = picam_ir.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
-        lores={"size": (320, 240), "format": "RGB888"},
+        lores={"size": (640, 480), "format": "RGB888"},
         raw={"format": "SRGGB12_CSI2P", "size": (2028, 1520)},
         transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw(),
@@ -215,7 +235,7 @@ def main():
     )
     config_rgb = picam_rgb.create_preview_configuration(
         main={"size": (2028, 1520), "format": "RGB888"},
-        lores={"size": (320, 240), "format": "RGB888"},
+        lores={"size": (640, 480), "format": "RGB888"},
         raw={"format": "SRGGB12_CSI2P", "size": (2028, 1520)},
         transform=Transform(vflip=True, hflip=True),
         colour_space=ColorSpace.Raw(),
@@ -236,8 +256,8 @@ def main():
 
     print("Press 'q' to quit the live feed loop...")
 
-    # keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    # keyboard_thread.start()
+    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    keyboard_thread.start()
     t0 = threading.Thread(target=gpio_listener, args=(picam_ir, picam_rgb,), daemon=True)
 
     try:
@@ -263,10 +283,18 @@ def main():
             frame_ir_pil = Image.fromarray(frame_ir_corrected, 'RGB')
             frame_rgb_pil = Image.fromarray(frame_rgb_corrected, 'RGB')
 
+            if shared_state.zoom != 1.0:
+                frame_ir_pil = apply_digital_zoom(frame_ir_pil, shared_state.zoom)
+                frame_rgb_pil = apply_digital_zoom(frame_rgb_pil, shared_state.zoom)
+
             # Calculate crop coordinates to get center of images
             # For 240x320 images, get the center 160 vertical pixels
-            crop_sides = frame_ir_pil.width // 4
-            crop_height = frame_ir_pil.height
+            crop_sides = 80 #frame_ir_pil.width // 4
+            crop_height = 240 # frame_ir_pil.height
+
+
+            frame_ir_pil = frame_ir_pil.resize((320, 240), Image.BILINEAR)
+            frame_rgb_pil = frame_rgb_pil.resize((320, 240), Image.BILINEAR)
 
             # Crop images to center 160 pixels vertically
             frame_ir_cropped = frame_ir_pil.crop((crop_sides, 0, crop_height, crop_height))
@@ -282,6 +310,7 @@ def main():
             ir_focus = f"{metadata_ir['FocusFoM']}"
             rgb_focus = f"{metadata_rgb['FocusFoM']}"
             draw = ImageDraw.Draw(combined_img)
+
             
             if shared_state.display_state == DisplayState.SPLIT:
                 combined_img.paste(frame_rgb_cropped, (0, 0))
@@ -294,6 +323,8 @@ def main():
             elif shared_state.display_state == DisplayState.IR_ONLY:
                 combined_img.paste(frame_ir_pil, (0, 0))
                 draw.text((170, 10), f"IR Focus: {ir_focus}", fill=(57, 255, 20), font=font)
+
+            draw.text((132, 222), f"Zoom: {shared_state.zoom:.1f}", fill=(57, 255, 20), font=font)
 
             current_time = time.time()
             if shared_state.capture_notification and (current_time - shared_state.notification_start_time) < shared_state.notification_duration:
