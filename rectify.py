@@ -1,7 +1,7 @@
 import os
 import cv2
+import glob
 import numpy as np
-# Import any GUI framework you prefer (e.g., PySimpleGUI, Tkinter) for viewing/debugging
 
 # -----------------------------------------------------------------------------
 # Utility Functions
@@ -22,7 +22,6 @@ def load_camera_info(npz_path):
             - 'dist1': Right distortion coefficients
             - 'R1', 'R2', 'P1', 'P2', 'Q': Rectification and projection matrices.
     """
-    # TODO: load the NPZ file and extract parameters
     camera_info = np.load(npz_path)
     return camera_info
 
@@ -31,15 +30,21 @@ def get_image_pairs(input_dir):
     """
     Scan the given directory for image pairs.
     Assumes a naming convention that pairs images from two cameras (e.g., left_001.jpg, right_001.jpg).
-    
+    Where left is IR and right is RGB
+
     Args:
         input_dir (str): Directory containing stereo image pairs.
     
     Returns:
         list of tuples: Each tuple is (left_image_path, right_image_path).
     """
-    # TODO: Implement a function to parse file names and pair them
-    image_pairs = []  # e.g., [('path/to/left_001.jpg', 'path/to/right_001.jpg'), ...]
+    ir_images = glob.glob(f"{input_dir}/*_ir.jpg") 
+    rgb_images = glob.glob(f"{input_dir}/*_rgb.jpg") 
+    ir_images.sort()
+    rgb_images.sort()
+    image_pairs = []
+    for ir, rgb in zip(ir_images, rgb_images):
+        image_pairs.append((ir, rgb))
     return image_pairs
 
 
@@ -47,13 +52,13 @@ def get_image_pairs(input_dir):
 # Processing Steps
 # -----------------------------------------------------------------------------
 
-def rectify_image_pair(left_img, right_img, camera_info, save_intermediate=False, output_dir=None):
+def rectify_image_pair(left_path : str, right_path : str, camera_info, save_intermediate=False, output_dir=None):
     """
     Rectify a stereo pair using the provided camera calibration info.
     
     Args:
-        left_img (np.ndarray): Original left image.
-        right_img (np.ndarray): Original right image.
+        left_path (str): Original left image path.
+        right_path (str): Original right image path.
         camera_info (dict): Dictionary containing camera matrices, distortion coeffs, R1, R2, P1, P2, etc.
         save_intermediate (bool): Whether to save the rectified images.
         output_dir (str): Directory to save rectified images (if saving is enabled).
@@ -61,69 +66,48 @@ def rectify_image_pair(left_img, right_img, camera_info, save_intermediate=False
     Returns:
         tuple: (rectified_left, rectified_right)
     """
-    # Use cv2.initUndistortRectifyMap() and cv2.remap() for each image.
-    # For example:
-    # map1x, map1y = cv2.initUndistortRectifyMap(cm0, dist0, R1, P1, image_size, cv2.CV_32FC1)
-    # rect_left = cv2.remap(left_img, map1x, map1y, cv2.INTER_LINEAR)
-    # Similarly for right image.
-    
-    # TODO: Implement rectification
-    rect_left = left_img  # Placeholder
-    rect_right = right_img  # Placeholder
+    left_img = cv2.imread(left_path)
+    right_img = cv2.imread(right_path)
 
+    rect_left = cv2.remap(left_img, camera_info['map1x'], camera_info['map1y'], cv2.INTER_LINEAR)
+    rect_right = cv2.remap(right_img, camera_info['map2x'], camera_info['map2y'], cv2.INTER_LINEAR)
+
+    left_img_name = os.path.splitext(os.path.basename(left_path))[0]
+    right_img_name = os.path.splitext(os.path.basename(right_path))[0]
     if save_intermediate and output_dir:
         # Save rectified images to output_dir
-        cv2.imwrite(os.path.join(output_dir, "rectified_left.jpg"), rect_left)
-        cv2.imwrite(os.path.join(output_dir, "rectified_right.jpg"), rect_right)
+        cv2.imwrite(os.path.join(output_dir, f"{left_img_name}_rect.jpg"), rect_left)
+        cv2.imwrite(os.path.join(output_dir, f"{right_img_name}_rect.jpg"), rect_right)
     
     return rect_left, rect_right
 
+def align_images_with_sift(img_src, img_dst, min_match_count=10):
+    gray_src = cv2.cvtColor(img_src, cv2.COLOR_BGR2GRAY) if img_src.ndim == 3 else img_src
+    gray_dst = cv2.cvtColor(img_dst, cv2.COLOR_BGR2GRAY) if img_dst.ndim == 3 else img_dst
 
-def compute_disparity(rect_left, rect_right, save_intermediate=False, output_dir=None):
-    """
-    Compute the disparity map for a rectified stereo pair using StereoSGBM + WLS filtering.
+    sift = cv2.SIFT_create()
+    kp1, des1 = sift.detectAndCompute(gray_src, None)
+    kp2, des2 = sift.detectAndCompute(gray_dst, None)
+
+    index_params = dict(algorithm=1, trees=5)
+    search_params = dict(checks=50)
+    flann = cv2.FlannBasedMatcher(index_params, search_params)
+
+    matches = flann.knnMatch(des1, des2, k=2)
+    good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
+
+    if len(good_matches) < min_match_count:
+        return None, None
+        # raise ValueError(f"Not enough matches found - {len(good_matches)} < {min_match_count}")
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
     
-    Args:
-        rect_left (np.ndarray): Rectified left image.
-        rect_right (np.ndarray): Rectified right image.
-        save_intermediate (bool): Whether to save the disparity map.
-        output_dir (str): Directory to save the disparity map.
-    
-    Returns:
-        np.ndarray: The filtered disparity map.
-    """
-    # TODO: Set up StereoSGBM parameters and compute disparity, then filter it.
-    # Use your current disparity implementation with WLS filtering.
-    disparity = np.zeros(rect_left.shape[:2], dtype=np.float32)  # Placeholder
-    
-    if save_intermediate and output_dir:
-        # Save disparity image (after normalization if needed)
-        disp_vis = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX)
-        cv2.imwrite(os.path.join(output_dir, "disparity.jpg"), disp_vis)
-    
-    return disparity
+    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+    aligned = cv2.warpPerspective(img_src, H, (img_dst.shape[1], img_dst.shape[0]))
+    return aligned, H
 
 
-def warp_image_pair(rect_right, disparity, save_intermediate=False, output_dir=None):
-    """
-    Warp the rectified right image into the left image's coordinate system using the disparity map.
-    
-    Args:
-        rect_right (np.ndarray): Rectified right image.
-        disparity (np.ndarray): Filtered disparity map.
-        save_intermediate (bool): Whether to save the warped image.
-        output_dir (str): Directory to save the warped image.
-    
-    Returns:
-        np.ndarray: The warped right image.
-    """
-    # TODO: Create a coordinate grid, adjust x-coordinates by disparity, and use cv2.remap().
-    warped_right = rect_right  # Placeholder
-    
-    if save_intermediate and output_dir:
-        cv2.imwrite(os.path.join(output_dir, "warped_right.jpg"), warped_right)
-    
-    return warped_right
 
 
 def overlay_images(rect_left, warped_right, save_intermediate=False, output_dir=None):
@@ -214,37 +198,38 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
     
     # Get list of image pairs
     pairs = get_image_pairs(input_dir)
-    
+
+    aligned = 0
+
     for left_path, right_path in pairs:
         # Load original images
         original_left = cv2.imread(left_path)
         original_right = cv2.imread(right_path)
         
         # Step 1: Rectify the stereo pair
-        rect_left, rect_right = rectify_image_pair(original_left, original_right,
+        rect_left, rect_right = rectify_image_pair(left_path, right_path,
                                                    camera_info,
                                                    save_intermediate=save_options.get('rectified', False),
                                                    output_dir=output_dirs.get('rectified', None))
         
-        # Step 2: Compute disparity map for the rectified pair
-        disparity = compute_disparity(rect_left, rect_right,
-                                      save_intermediate=save_options.get('disparity', False),
-                                      output_dir=output_dirs.get('disparity', None))
-        
-        # Step 3: Warp the right rectified image to align with the left
-        warped_right = warp_image_pair(rect_right, disparity,
-                                       save_intermediate=save_options.get('warped', False),
-                                       output_dir=output_dirs.get('warped', None))
-        
-        # Step 4: Create overlay of the warped right image and the left rectified image
+        # Step 2: Compute Homography and align right image to left
+        warped_right, H = align_images_with_sift(rect_left, rect_right)
+        if warped_right is None:
+            print(f"Failed to align {right_path} to {left_path}")
+            continue
+
+        if save_options.get('warped', False):
+            cv2.imwrite(os.path.join(output_dirs.get('warped', None), os.path.basename(right_path)), warped_right)
+
+        aligned += 1
+        print("Aligned images: ", left_path, right_path)
+        if aligned == 5:
+            break
+        # Step 3: Create overlay of the warped right image and the left rectified image
         overlay = overlay_images(rect_left, warped_right,
                                  save_intermediate=save_options.get('overlay', False),
                                  output_dir=output_dirs.get('overlay', None))
-        
-        # Optionally display results in a GUI for debugging/inspection
-        if view_results:
-            view_pipeline_results(original_left, original_right, rect_left, rect_right, disparity, warped_right, overlay)
-        
+
         # TODO: Optionally log progress, handle errors, etc.
         
 
@@ -254,13 +239,13 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
 
 if __name__ == "__main__":
     # Define paths and options (adjust as needed)
-    input_directory = "path/to/input_images"
-    camera_npz_path = "path/to/camera_info.npz"
+    input_directory = "./DATA/data_04_06_2025"
+    camera_npz_path = "./calibration_files/calib_data7.npz"
     output_directories = {
-        'rectified': "path/to/save/rectified",
-        'disparity': "path/to/save/disparity",
-        'warped': "path/to/save/warped",
-        'overlay': "path/to/save/overlay"
+        'rectified': "DATA/data_04_06_2025/rectified",
+        'disparity': "DATA/data_04_06_2025/disparity",
+        'warped': "DATA/data_04_06_2025/warped",
+        'overlay': "DATA/data_04_06_2025/overlay"
     }
     save_opts = {
         'rectified': True,

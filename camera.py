@@ -14,7 +14,7 @@ import os
 from enum import Enum
 
 
-SAVE_DIR = "./two_rgb"
+SAVE_DIR = "./DATA/04_13_2025"
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
 
@@ -38,6 +38,8 @@ shared_state = SharedState()
 
 BUTTON_OFFSET = 16
 SWITCH_VIEW_OFFSET = 26
+ZOOM_IN_OFFSET = 6
+ZOOM_OUT_OFFSET = 13
 CHIP_NAME = "/dev/gpiochip0"
 
 button_request = gpiod.request_lines(
@@ -57,6 +59,30 @@ switch_view_request = gpiod.request_lines(
     consumer="button-app",
     config={
         SWITCH_VIEW_OFFSET: gpiod.LineSettings(
+            direction=gpiod.line.Direction.INPUT,
+            edge_detection=gpiod.line.Edge.RISING,
+            bias=gpiod.line.Bias.PULL_DOWN
+        )
+    }
+)
+
+zoom_in_request = gpiod.request_lines(
+    CHIP_NAME,
+    consumer="button-app",
+    config={
+        ZOOM_IN_OFFSET: gpiod.LineSettings(
+            direction=gpiod.line.Direction.INPUT,
+            edge_detection=gpiod.line.Edge.RISING,
+            bias=gpiod.line.Bias.PULL_DOWN
+        )
+    }
+)
+
+zoom_out_request = gpiod.request_lines(
+    CHIP_NAME,
+    consumer="button-app",
+    config={
+        ZOOM_OUT_OFFSET: gpiod.LineSettings(
             direction=gpiod.line.Direction.INPUT,
             edge_detection=gpiod.line.Edge.RISING,
             bias=gpiod.line.Bias.PULL_DOWN
@@ -85,32 +111,32 @@ def gpio_listener(cam0, cam1):
     last_press_time = 0
     debounce_time = 1
     capture_in_progress = False
-    
+
     while not stop_event.is_set():
         try:
             # Skip event processing if capturing is in progress
             if capture_in_progress:
                 time.sleep(0.05)
                 continue
-                
+
             # Wait for events with a 1 second timeout
             if button_request.wait_edge_events(timeout=timedelta(seconds=1)):
                 events = button_request.read_edge_events(max_events=1)
-                
+
                 # Process only if events exist
                 if events:
                     current_time = time.time()
                     event = events[0]
-                    
+
                     # Check if this is a valid button press (debounce)
                     if (event.line_offset == BUTTON_OFFSET and 
                         event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE and
                         (current_time - last_press_time) > debounce_time):
-                        
+
                         # Set flag to prevent further captures while processing
                         capture_in_progress = True
                         last_press_time = current_time
-                        
+
                         print("Button pressed! Capturing images...")
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         dir = SAVE_DIR
@@ -149,7 +175,7 @@ def gpio_listener(cam0, cam1):
                         request_ir.release()
                         # metadata_rgb = rgb_task.result()
                         # metadata_ir = ir_task.result()
-                        
+
                         sync.release()
                         print(f"Metadata: {metadata_rgb}")
                         print(f"Metadata: {metadata_ir}")
@@ -157,7 +183,7 @@ def gpio_listener(cam0, cam1):
                         rgb_exposure_start_time = metadata_rgb['SensorTimestamp'] - 1000 * metadata_rgb['ExposureTime']
                         ir_exposure_start_time = metadata_ir['SensorTimestamp'] - 1000 * metadata_ir['ExposureTime']
                         print(f"difference in exposure start time in ms: {abs(ir_exposure_start_time - rgb_exposure_start_time) / 1e6:.6f} ms")
-                       
+
                         # send notification flag 
                         shared_state.capture_notification = True
                         shared_state.notification_start_time = time.time()
@@ -175,6 +201,24 @@ def gpio_listener(cam0, cam1):
                         event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE):
                         print("Switching display state...")
                         cycle_display_state()
+
+            elif zoom_in_request.wait_edge_events(timeout=timedelta(seconds=1)):
+                events = zoom_in_request.read_edge_events(max_events=1)
+                if events:
+                    event = events[0]
+                    if (event.line_offset == ZOOM_IN_OFFSET and 
+                        event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE):
+                        shared_state.zoom += 0.1
+                        print(f"Zoom increased to {shared_state.zoom:.1f}")
+
+            elif zoom_out_request.wait_edge_events(timeout=timedelta(seconds=1)):
+                events = zoom_out_request.read_edge_events(max_events=1)
+                if events:
+                    event = events[0]
+                    if (event.line_offset == ZOOM_OUT_OFFSET and 
+                        event.event_type == gpiod.EdgeEvent.Type.RISING_EDGE):
+                        shared_state.zoom -= 0.1
+                        print(f"Zoom decreased to {shared_state.zoom:.1f}")
 
         except Exception as e:
             print(f"Error in GPIO listener: {e}")
@@ -196,7 +240,6 @@ def apply_digital_zoom(frame, zoom_factor):
 
     zoomed = cropped.resize((w, h), resample=Image.BILINEAR)
     return zoomed
-
 
 def keyboard_listener():
     while not stop_event.is_set():
@@ -256,8 +299,8 @@ def main():
 
     print("Press 'q' to quit the live feed loop...")
 
-    keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
-    keyboard_thread.start()
+    # keyboard_thread = threading.Thread(target=keyboard_listener, daemon=True)
+    # keyboard_thread.start()
     t0 = threading.Thread(target=gpio_listener, args=(picam_ir, picam_rgb,), daemon=True)
 
     try:
@@ -292,7 +335,6 @@ def main():
             crop_sides = 80 #frame_ir_pil.width // 4
             crop_height = 240 # frame_ir_pil.height
 
-
             frame_ir_pil = frame_ir_pil.resize((320, 240), Image.BILINEAR)
             frame_rgb_pil = frame_rgb_pil.resize((320, 240), Image.BILINEAR)
 
@@ -311,7 +353,6 @@ def main():
             rgb_focus = f"{metadata_rgb['FocusFoM']}"
             draw = ImageDraw.Draw(combined_img)
 
-            
             if shared_state.display_state == DisplayState.SPLIT:
                 combined_img.paste(frame_rgb_cropped, (0, 0))
                 combined_img.paste(frame_ir_cropped, (disp.height // 2, 0))
