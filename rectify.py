@@ -110,7 +110,7 @@ def align_images_with_sift(img_src, img_dst, min_match_count=10):
 
 
 
-def overlay_images(rect_left, warped_right, save_intermediate=False, output_dir=None):
+def overlay_images(rect_left, warped_right, img_base_name, save_intermediate=False, output_dir=None):
     """
     Create an overlay of the rectified left image and the warped right image.
     
@@ -127,7 +127,7 @@ def overlay_images(rect_left, warped_right, save_intermediate=False, output_dir=
     overlay = cv2.addWeighted(rect_left, 0.5, warped_right, 0.5, 0)
     
     if save_intermediate and output_dir:
-        cv2.imwrite(os.path.join(output_dir, "overlay.jpg"), overlay)
+        cv2.imwrite(os.path.join(output_dir, f"{img_base_name}_overlay.jpg"), overlay)
     
     return overlay
 
@@ -217,22 +217,28 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
         if warped_right is None:
             print(f"Failed to align {right_path} to {left_path}")
             continue
+        
+        right_img_name = os.path.splitext(os.path.basename(right_path))[0]
 
         if save_options.get('warped', False):
-            cv2.imwrite(os.path.join(output_dirs.get('warped', None), os.path.basename(right_path)), warped_right)
+            cv2.imwrite(os.path.join(output_dirs.get('warped', None), f'{right_img_name}_warped.jpg'), warped_right)
 
+    
+        # Step 3: Create overlay of the warped right image and the left rectified imag
+        base_img_name = right_img_name[0:-4]
+        overlay = overlay_images(rect_right, warped_right,
+                                 base_img_name,
+                                 save_intermediate=save_options.get('overlay', True),
+                                 output_dir=output_dirs.get('overlay', None))
+        
         aligned += 1
         print("Aligned images: ", left_path, right_path)
-        if aligned == 5:
-            break
-        # Step 3: Create overlay of the warped right image and the left rectified image
-        overlay = overlay_images(rect_left, warped_right,
-                                 save_intermediate=save_options.get('overlay', False),
-                                 output_dir=output_dirs.get('overlay', None))
+        # if aligned == 5:
+        #     break
 
         # TODO: Optionally log progress, handle errors, etc.
         
-
+    print(f"aligned {aligned} images")
 # -----------------------------------------------------------------------------
 # Example Usage (Main Function)
 # -----------------------------------------------------------------------------
