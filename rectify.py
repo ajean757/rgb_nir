@@ -131,6 +131,25 @@ def overlay_images(rect_left, warped_right, img_base_name, save_intermediate=Fal
     
     return overlay
 
+def aerochrome_filter(img_ir, img_rgb, img_base_name, save_intermediate=False, output_dir=None):
+
+
+    ir_channel = cv2.cvtColor(img_ir, cv2.COLOR_BGR2GRAY)
+    green_channel = img_rgb[:,:,1]
+    red_channel = img_rgb[:,:,2]
+
+
+    result = cv2.merge([
+        green_channel,   # Blue channel <- Green
+        red_channel,     # Green channel <- Red
+        ir_channel       # Red channel <- IR
+    ])
+
+    if save_intermediate and output_dir:
+        cv2.imwrite(os.path.join(output_dir, f"{img_base_name}_aerochrome.jpg"), result)
+
+    
+
 
 # -----------------------------------------------------------------------------
 # GUI/Debug Viewer
@@ -200,8 +219,10 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
     pairs = get_image_pairs(input_dir)
 
     aligned = 0
+    num_imgs = 0
 
     for left_path, right_path in pairs:
+        num_imgs += 1
         # Load original images
         original_left = cv2.imread(left_path)
         original_right = cv2.imread(right_path)
@@ -212,24 +233,30 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
                                                    save_intermediate=save_options.get('rectified', False),
                                                    output_dir=output_dirs.get('rectified', None))
         
-        # Step 2: Compute Homography and align right image to left
-        warped_right, H = align_images_with_sift(rect_left, rect_right)
-        if warped_right is None:
+        # Step 2: Compute Homography and align left image to right
+        warped_left, H = align_images_with_sift(rect_left, rect_right)
+        if warped_left is None:
             print(f"Failed to align {right_path} to {left_path}")
             continue
         
-        right_img_name = os.path.splitext(os.path.basename(right_path))[0]
+        left_img_name = os.path.splitext(os.path.basename(left_path))[0]
 
         if save_options.get('warped', False):
-            cv2.imwrite(os.path.join(output_dirs.get('warped', None), f'{right_img_name}_warped.jpg'), warped_right)
+            cv2.imwrite(os.path.join(output_dirs.get('warped', None), f'{left_img_name}_warped.jpg'), warped_left)
 
     
         # Step 3: Create overlay of the warped right image and the left rectified imag
-        base_img_name = right_img_name[0:-4]
-        overlay = overlay_images(rect_right, warped_right,
+        base_img_name = left_img_name[0:-3]
+        overlay = overlay_images(rect_right, warped_left,
                                  base_img_name,
                                  save_intermediate=save_options.get('overlay', True),
                                  output_dir=output_dirs.get('overlay', None))
+        
+        # Step 4: Create IR false color
+        aerochrome = aerochrome_filter(warped_left, rect_right, 
+                                       base_img_name,
+                                       save_intermediate=save_options.get('aerochrome', True),
+                                       output_dir=output_dirs.get('aerochrome',None))
         
         aligned += 1
         print("Aligned images: ", left_path, right_path)
@@ -238,7 +265,7 @@ def process_stereo_dataset(input_dir, npz_path, output_dirs, save_options, view_
 
         # TODO: Optionally log progress, handle errors, etc.
         
-    print(f"aligned {aligned} images")
+    print(f"aligned {aligned} images out of {num_imgs}")
 # -----------------------------------------------------------------------------
 # Example Usage (Main Function)
 # -----------------------------------------------------------------------------
@@ -251,13 +278,15 @@ if __name__ == "__main__":
         'rectified': "DATA/data_04_06_2025/rectified",
         'disparity': "DATA/data_04_06_2025/disparity",
         'warped': "DATA/data_04_06_2025/warped",
-        'overlay': "DATA/data_04_06_2025/overlay"
+        'overlay': "DATA/data_04_06_2025/overlay",
+        'aerochrome': "DATA/data_04_06_2025/aerochrome"
     }
     save_opts = {
         'rectified': True,
         'disparity': True,
         'warped': True,
-        'overlay': True
+        'overlay': True,
+        'aerochrome':True
     }
     
     # Create output directories if they don't exist
