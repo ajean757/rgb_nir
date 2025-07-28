@@ -665,14 +665,14 @@ class RGBNIRPipeline:
 
     def _save_overlay_image(self, left_path: str, overlay: np.ndarray, output_dir: str) -> None:
         """Save overlay image in multiple formats."""
-        base_name = os.path.splitext(os.path.basename(left_path))[0][:-3]  # Remove '_ir' suffix
+        base_name = os.path.splitext(os.path.basename(left_path))[0].removesuffix('_ir')  # Remove '_ir' suffix
         
         self.saver.save_as_png16(overlay, os.path.join(output_dir, f"{base_name}_overlay.png"))
         self.saver.save_as_jpeg(overlay, os.path.join(output_dir, f"{base_name}_overlay.jpg"))
 
     def _save_aerochrome_image(self, left_path: str, aerochrome: np.ndarray, output_dir: str) -> None:
         """Save aerochrome image in multiple formats."""
-        base_name = os.path.splitext(os.path.basename(left_path))[0][:-3]  # Remove '_ir' suffix
+        base_name = os.path.splitext(os.path.basename(left_path))[0].removesuffix('_ir') # Remove '_ir' suffix
         
         self.saver.save_as_png16(aerochrome, os.path.join(output_dir, f"{base_name}_aerochrome.png"))
         self.saver.save_as_jpeg(aerochrome, os.path.join(output_dir, f"{base_name}_aerochrome.jpg"))
@@ -721,7 +721,7 @@ def main():
     parser.add_argument('-gdi-sift', action='store_true',
                        help='Use GDI SIFT for feature detection')
     parser.add_argument('--anms', action='store_true',
-                       help='Disable Adaptive Non-Maximal Suppression')
+                       help='Enable Adaptive Non-Maximal Suppression')
     parser.add_argument('--anms-keypoints', type=int, default=500,
                        help='Number of keypoints to keep with ANMS')
     parser.add_argument('--anms-suppression', type=float, default=0.9,
