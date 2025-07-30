@@ -50,13 +50,20 @@ class ProcessingOptions:
     anms_suppression: float = 0.9
     min_match_count: int = 10
     debug_visual: bool = False
+    verbose: bool = False
+    # DNG enhancement options
+    dng_enhance_contrast: bool = True
+    dng_brightness: float = 1.2
+    dng_exposure_shift: float = 0.3
 
 
 class ImageLoader:
     """Handles loading and processing of DNG and JPEG images."""
     
-    @staticmethod
-    def load_rgb_from_dng(dng_path: str) -> np.ndarray:
+    def __init__(self, options: ProcessingOptions = None):
+        self.options = options or ProcessingOptions()
+    
+    def load_rgb_from_dng(self, dng_path: str) -> np.ndarray:
         """
         Load an RGB DNG file and process it to linear RGB (converted to BGR for OpenCV).
         
@@ -67,21 +74,28 @@ class ImageLoader:
             RGB image in [0,1] float32 format, shape (H, W, 3)
         """
         with rawpy.imread(dng_path) as raw:
-            # Process with linear gamma and camera white balance
+            # Process with gamma correction for better feature detection
+            # Using gamma=2.2 instead of linear for improved contrast
             rgb = raw.postprocess(
-                gamma=(1, 1),
-                no_auto_bright=True,
+                gamma=(1, 1),  # Apply gamma correction for better contrast
+                no_auto_bright=False,  # Allow auto brightness for better feature detection
                 output_bps=16,
-                use_camera_wb=True
+                use_camera_wb=True,
+                bright=self.options.dng_brightness,  # Configurable brightness
+                exp_shift=self.options.dng_exposure_shift  # Configurable exposure compensation
             )
             # Convert to float32 and normalize to [0,1]
             rgb = rgb.astype(np.float32) / 65535.0
+            
+            # Apply histogram stretching for better contrast if enabled
+            if self.options.dng_enhance_contrast:
+                rgb = self._enhance_contrast(rgb)
+            
             # Convert from RGB to BGR for OpenCV
             rgb = rgb[..., ::-1]
             return rgb
 
-    @staticmethod
-    def load_nir_from_dng(dng_path: str) -> np.ndarray:
+    def load_nir_from_dng(self, dng_path: str) -> np.ndarray:
         """
         Load a NIR DNG file from monochrome sensor and process it.
         
@@ -106,13 +120,67 @@ class ImageLoader:
             # Clip to [0,1]
             nir_raw = np.clip(nir_raw, 0, 1)
             
+            # Apply contrast enhancement for better feature detection if enabled
+            if self.options.dng_enhance_contrast:
+                nir_raw = self._enhance_contrast_single_channel(nir_raw)
+            
             # Convert to 3-channel for compatibility with OpenCV operations
             nir_bgr = cv2.merge([nir_raw, nir_raw, nir_raw])
             
             return nir_bgr
 
-    @classmethod
-    def load_image_smart(cls, image_path: str) -> np.ndarray:
+    @staticmethod
+    def load_nir_from_jpeg(image_path: str) -> np.ndarray:
+        """
+        Load a NIR JPEG image and extract the cleanest monochromatic channel.
+        
+        Many NIR JPEG images captured from monochromatic sensors may have color
+        artifacts from inappropriate processing during capture. This function
+        attempts to recover the cleanest single-channel representation.
+        
+        Args:
+            image_path: Path to NIR JPEG file
+            
+        Returns:
+            NIR image in [0,1] float32 format, shape (H, W, 3) for compatibility
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise ValueError(f"Could not load image: {image_path}")
+        
+        # Convert to float32 for processing
+        img = img.astype(np.float32) / 255.0
+        
+        # Extract individual channels (BGR format)
+        b_channel = img[:, :, 0]
+        g_channel = img[:, :, 1] 
+        r_channel = img[:, :, 2]
+        
+        # For NIR cameras captured with RGB888 format, often the red channel
+        # contains the cleanest NIR signal. We also check channel variance
+        # to automatically select the best channel.
+        channel_variances = {
+            'red': np.var(r_channel),
+            'green': np.var(g_channel),
+            'blue': np.var(b_channel)
+        }
+        
+        # Select channel with highest variance (most information content)
+        best_channel_name = max(channel_variances, key=channel_variances.get)
+        
+        if best_channel_name == 'red':
+            nir_channel = r_channel
+        elif best_channel_name == 'green':
+            nir_channel = g_channel
+        else:
+            nir_channel = b_channel
+            
+        # Convert to 3-channel for compatibility with OpenCV operations
+        nir_bgr = cv2.merge([nir_channel, nir_channel, nir_channel])
+        
+        return nir_bgr
+
+    def load_image_smart(self, image_path: str) -> np.ndarray:
         """
         Load an image file, automatically detecting if it's JPEG or DNG.
         
@@ -128,20 +196,72 @@ class ImageLoader:
             # Determine if it's RGB or NIR based on filename
             filename_lower = os.path.basename(image_path).lower()
             if '_rgb' in filename_lower:
-                return cls.load_rgb_from_dng(image_path)
+                return self.load_rgb_from_dng(image_path)
             elif '_ir' in filename_lower or '_nir' in filename_lower:
-                return cls.load_nir_from_dng(image_path)
+                return self.load_nir_from_dng(image_path)
             else:
                 # Default to RGB processing
-                return cls.load_rgb_from_dng(image_path)
+                return self.load_rgb_from_dng(image_path)
         else:
-            # Load JPEG/PNG with OpenCV and normalize
-            img = cv2.imread(image_path)
-            if img is None:
-                raise ValueError(f"Could not load image: {image_path}")
-            img = img.astype(np.float32) / 255.0
-            return img
+            # Determine if it's RGB or NIR based on filename for JPEG/PNG
+            filename_lower = os.path.basename(image_path).lower()
+            if '_ir' in filename_lower or '_nir' in filename_lower:
+                return self.load_nir_from_jpeg(image_path)
+            else:
+                # Load RGB JPEG/PNG with OpenCV and normalize
+                img = cv2.imread(image_path)
+                if img is None:
+                    raise ValueError(f"Could not load image: {image_path}")
+                img = img.astype(np.float32) / 255.0
+                return img
 
+    def _enhance_contrast(self, img: np.ndarray) -> np.ndarray:
+        """
+        Apply histogram stretching for better contrast in multi-channel images.
+        
+        Args:
+            img: Input image in [0,1] float32 format
+            
+        Returns:
+            Contrast-enhanced image in [0,1] float32 format
+        """
+        enhanced = img.copy()
+        
+        # Apply per-channel histogram stretching
+        for ch in range(img.shape[2]):
+            channel = img[:, :, ch]
+            
+            # Calculate percentiles for robust stretching
+            p2, p98 = np.percentile(channel, (2, 98))
+            
+            # Avoid division by zero
+            if p98 > p2:
+                # Stretch to full range
+                channel_stretched = (channel - p2) / (p98 - p2)
+                enhanced[:, :, ch] = np.clip(channel_stretched, 0, 1)
+        
+        return enhanced
+    
+    def _enhance_contrast_single_channel(self, img: np.ndarray) -> np.ndarray:
+        """
+        Apply histogram stretching for better contrast in single-channel images.
+        
+        Args:
+            img: Input single-channel image in [0,1] float32 format
+            
+        Returns:
+            Contrast-enhanced image in [0,1] float32 format
+        """
+        # Calculate percentiles for robust stretching
+        p2, p98 = np.percentile(img, (2, 98))
+        
+        # Avoid division by zero
+        if p98 > p2:
+            # Stretch to full range
+            img_stretched = (img - p2) / (p98 - p2)
+            return np.clip(img_stretched, 0, 1)
+        else:
+            return img
 
 class ImageSaver:
     """Handles saving images in various formats."""
@@ -332,10 +452,12 @@ class ImageAligner:
         kp2, des2 = self.sift.detectAndCompute(gray_dst, None)
 
         if des1 is None or des2 is None:
-            print("Warning: No descriptors found in one or both images")
+            if self.options.verbose:
+                print("Warning: No descriptors found in one or both images")
             return None, None
 
-        print(f"Debug - initial SIFT keypoints: src={len(kp1)}, dst={len(kp2)}")
+        if self.options.verbose:
+            print(f"Debug - initial SIFT keypoints: src={len(kp1)}, dst={len(kp2)}")
 
         # Apply ANMS if enabled
         if self.options.use_anms:
@@ -349,7 +471,8 @@ class ImageAligner:
                 kp2, des2, self.options.anms_num_keypoints, self.options.anms_suppression
             )
             
-            print(f"Debug - after ANMS keypoints: src={len(kp1)}, dst={len(kp2)}")
+            if self.options.verbose:
+                print(f"Debug - after ANMS keypoints: src={len(kp1)}, dst={len(kp2)}")
             
             # Visual debug if enabled
             if self.options.debug_visual:
@@ -361,8 +484,8 @@ class ImageAligner:
         return aligned_img, homography
 
     def _to_uint8(self, img: np.ndarray) -> np.ndarray:
-        """Convert float32 [0,1] image to uint8."""
-        if img.dtype == np.float32:
+        """Convert float32/float64 [0,1] image to uint8."""
+        if img.dtype in [np.float32, np.float64]:
             return (img * 255).astype(np.uint8)
         return img
 
@@ -384,22 +507,26 @@ class ImageAligner:
         matches = flann.knnMatch(des1, des2, k=2)
         good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
         
-        print(f"Debug - raw FLANN matches: {len(matches)}")
-        print(f"Debug - good matches after ratio test: {len(good_matches)}")
+        if self.options.verbose:
+            print(f"Debug - raw FLANN matches: {len(matches)}")
+            print(f"Debug - good matches after ratio test: {len(good_matches)}")
 
         # Retry without ANMS if insufficient matches
         if len(good_matches) < self.options.min_match_count and self.options.use_anms:
-            print("Debug - ANMS matching insufficient, retrying without ANMS filtering...")
+            if self.options.verbose:
+                print("Debug - ANMS matching insufficient, retrying without ANMS filtering...")
             kp1, des1 = self.sift.detectAndCompute(gray_src, None)
             kp2, des2 = self.sift.detectAndCompute(gray_dst, None)
             des1 = des1.astype(np.float32)
             des2 = des2.astype(np.float32)
             matches = flann.knnMatch(des1, des2, k=2)
             good_matches = [m for m, n in matches if m.distance < 0.75 * n.distance]
-            print(f"Debug - retry good matches after ratio test: {len(good_matches)}")
+            if self.options.verbose:
+                print(f"Debug - retry good matches after ratio test: {len(good_matches)}")
 
         if len(good_matches) < self.options.min_match_count:
-            print(f"Debug - insufficient matches: {len(good_matches)} < {self.options.min_match_count}")
+            if self.options.verbose:
+                print(f"Debug - insufficient matches: {len(good_matches)} < {self.options.min_match_count}")
             return None, None
 
         # Compute homography
@@ -409,17 +536,19 @@ class ImageAligner:
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
         
         if H is None:
-            print("Debug - homography computation failed")
+            if self.options.verbose:
+                print("Debug - homography computation failed")
             return None, None
         
         # Apply transformation
         aligned = cv2.warpPerspective(img_src, H, (img_dst.shape[1], img_dst.shape[0]))
         
         # Debug info
-        inliers = int(mask.sum()) if mask is not None else 0
-        print(f"Debug - SIFT matches: {len(good_matches)}, inliers: {inliers}")
-        print(f"Debug - Source image dtype: {img_src.dtype}, range: [{img_src.min():.3f}, {img_src.max():.3f}]")
-        print(f"Debug - Aligned image dtype: {aligned.dtype}, range: [{aligned.min():.3f}, {aligned.max():.3f}]")
+        if self.options.verbose:
+            inliers = int(mask.sum()) if mask is not None else 0
+            print(f"Debug - SIFT matches: {len(good_matches)}, inliers: {inliers}")
+            print(f"Debug - Source image dtype: {img_src.dtype}, range: [{img_src.min():.3f}, {img_src.max():.3f}]")
+            print(f"Debug - Aligned image dtype: {aligned.dtype}, range: [{aligned.min():.3f}, {aligned.max():.3f}]")
         
         return aligned, H
 
@@ -427,8 +556,9 @@ class ImageAligner:
 class CameraRectifier:
     """Handles camera rectification using calibration parameters."""
     
-    def __init__(self, camera_info: Dict[str, Any]):
+    def __init__(self, camera_info: Dict[str, Any], options: ProcessingOptions = None):
         self.camera_info = camera_info
+        self.loader = ImageLoader(options)
 
     def rectify_pair(self, left_path: str, right_path: str) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -442,8 +572,8 @@ class CameraRectifier:
             Tuple of (rectified_left, rectified_right)
         """
         # Load images
-        left_img = ImageLoader.load_image_smart(left_path)
-        right_img = ImageLoader.load_image_smart(right_path)
+        left_img = self.loader.load_image_smart(left_path)
+        right_img = self.loader.load_image_smart(right_path)
         
         # Convert to uint8 for cv2.remap
         left_uint8 = self._to_uint8(left_img)
@@ -460,8 +590,8 @@ class CameraRectifier:
         return rect_left, rect_right
 
     def _to_uint8(self, img: np.ndarray) -> np.ndarray:
-        """Convert float32 [0,1] image to uint8."""
-        if img.dtype == np.float32:
+        """Convert float32/float64 [0,1] image to uint8."""
+        if img.dtype in [np.float32, np.float64]:
             return (img * 255).astype(np.uint8)
         return img
 
@@ -510,7 +640,7 @@ class ImageProcessor:
         Create an aerochrome (false color infrared) image.
         
         Args:
-            img_ir: IR image
+            img_ir: IR image (may be 3-channel with color artifacts)
             img_rgb: RGB image
             
         Returns:
@@ -522,17 +652,35 @@ class ImageProcessor:
         if img_rgb.dtype != np.float32:
             img_rgb = img_rgb.astype(np.float32) / 255.0
 
-        # Extract IR channel (convert to grayscale if needed)
+        # Extract IR channel - use best approach for monochromatic data
         if img_ir.ndim == 3:
-            ir_channel = cv2.cvtColor((img_ir * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            # For NIR images with color artifacts, extract the channel with highest variance
+            r_channel = img_ir[:, :, 2]  # Red channel (typically best for NIR)
+            g_channel = img_ir[:, :, 1]  # Green channel
+            b_channel = img_ir[:, :, 0]  # Blue channel
+            
+            # Calculate variance to find the channel with most information
+            r_var = np.var(r_channel)
+            g_var = np.var(g_channel)
+            b_var = np.var(b_channel)
+            
+            # Select the channel with highest variance as it likely contains the cleanest NIR signal
+            if r_var >= g_var and r_var >= b_var:
+                ir_channel = r_channel
+            elif g_var >= b_var:
+                ir_channel = g_channel
+            else:
+                ir_channel = b_channel
         else:
             ir_channel = img_ir
         
-        # Extract RGB channels
-        green_channel = img_rgb[:, :, 1]
-        red_channel = img_rgb[:, :, 2]
+        # Extract RGB channels (note: OpenCV uses BGR order)
+        blue_channel = img_rgb[:, :, 0]   # Blue channel
+        green_channel = img_rgb[:, :, 1]  # Green channel  
+        red_channel = img_rgb[:, :, 2]    # Red channel
 
         # Create aerochrome: Blue <- Green, Green <- Red, Red <- IR
+        # This follows traditional false-color infrared mapping
         result = np.stack([
             green_channel,   # Blue channel <- Green
             red_channel,     # Green channel <- Red
@@ -548,7 +696,7 @@ class RGBNIRPipeline:
     def __init__(self, camera_npz_path: str, options: ProcessingOptions):
         self.options = options
         self.camera_info = self._load_camera_info(camera_npz_path)
-        self.rectifier = CameraRectifier(self.camera_info)
+        self.rectifier = CameraRectifier(self.camera_info, options)
         self.aligner = ImageAligner(options)
         self.processor = ImageProcessor()
         self.saver = ImageSaver()
@@ -568,13 +716,35 @@ class RGBNIRPipeline:
         Returns:
             List of (left_image_path, right_image_path) tuples
         """
+        ir_images = []
+        rgb_images = []
+        
         if file_extension:
-            ir_images = glob.glob(f"{input_dir}/*_ir.{file_extension}")
-            rgb_images = glob.glob(f"{input_dir}/*_rgb.{file_extension}")
+            # Try organized structure first
+            ir_organized = glob.glob(f"{input_dir}/originals/nir_{file_extension}/*")
+            rgb_organized = glob.glob(f"{input_dir}/originals/rgb_{file_extension}/*")
+            
+            # If organized structure exists, use it
+            if ir_organized and rgb_organized:
+                ir_images = ir_organized
+                rgb_images = rgb_organized
+            else:
+                # Fall back to flat directory structure
+                ir_images = glob.glob(f"{input_dir}/*_ir.{file_extension}")
+                rgb_images = glob.glob(f"{input_dir}/*_rgb.{file_extension}")
         else:
-            # Support both jpg and dng
-            ir_images = glob.glob(f"{input_dir}/*_ir.jpg") + glob.glob(f"{input_dir}/*_ir.dng")
-            rgb_images = glob.glob(f"{input_dir}/*_rgb.jpg") + glob.glob(f"{input_dir}/*_rgb.dng")
+            # Support both jpg and dng in organized structure
+            ir_organized = glob.glob(f"{input_dir}/originals/nir_jpg/*") + glob.glob(f"{input_dir}/originals/nir_dng/*")
+            rgb_organized = glob.glob(f"{input_dir}/originals/rgb_jpg/*") + glob.glob(f"{input_dir}/originals/rgb_dng/*")
+            
+            # If organized structure exists, use it
+            if ir_organized and rgb_organized:
+                ir_images = ir_organized
+                rgb_images = rgb_organized
+            else:
+                # Fall back to flat directory structure for both formats
+                ir_images = glob.glob(f"{input_dir}/*_ir.jpg") + glob.glob(f"{input_dir}/*_ir.dng")
+                rgb_images = glob.glob(f"{input_dir}/*_rgb.jpg") + glob.glob(f"{input_dir}/*_rgb.dng")
         
         ir_images.sort()
         rgb_images.sort()
@@ -595,7 +765,8 @@ class RGBNIRPipeline:
         """
         try:
             # Step 1: Rectify the stereo pair
-            print(f"Processing pair: {os.path.basename(left_path)}, {os.path.basename(right_path)}")
+            if self.options.verbose:
+                print(f"Processing pair: {os.path.basename(left_path)}, {os.path.basename(right_path)}")
             rect_left, rect_right = self.rectifier.rectify_pair(left_path, right_path)
             
             # Save rectified images if requested
@@ -606,7 +777,8 @@ class RGBNIRPipeline:
             warped_left, homography = self.aligner.align_images(rect_left, rect_right)
             
             if warped_left is None:
-                print(f"Failed to align {os.path.basename(right_path)} to {os.path.basename(left_path)}")
+                if self.options.verbose:
+                    print(f"Failed to align {os.path.basename(right_path)} to {os.path.basename(left_path)}")
                 return False
             
             # Save warped image if requested
@@ -619,22 +791,51 @@ class RGBNIRPipeline:
                 self._save_overlay_image(left_path, overlay, output_dirs['overlay'])
                 
                 # Print average values for debugging
-                avg_left = self.processor.calculate_average_per_channel(rect_right)
-                avg_warped = self.processor.calculate_average_per_channel(warped_left)
-                avg_overlay = self.processor.calculate_average_per_channel(overlay)
-                print(f"Debug - rect_right avg per channel: {avg_left}")
-                print(f"Debug - warped_left avg per channel: {avg_warped}")
-                print(f"Debug - overlay avg per channel: {avg_overlay}")
+                if self.options.verbose:
+                    avg_left = self.processor.calculate_average_per_channel(rect_right)
+                    avg_warped = self.processor.calculate_average_per_channel(warped_left)
+                    avg_overlay = self.processor.calculate_average_per_channel(overlay)
+                    print(f"Debug - rect_right avg per channel: {avg_left}")
+                    print(f"Debug - warped_left avg per channel: {avg_warped}")
+                    print(f"Debug - overlay avg per channel: {avg_overlay}")
             
             # Step 4: Create aerochrome
             if self.options.save_aerochrome and 'aerochrome' in output_dirs:
                 aerochrome = self.processor.create_aerochrome(warped_left, rect_right)
                 self._save_aerochrome_image(left_path, aerochrome, output_dirs['aerochrome'])
                 
-                avg_aerochrome = self.processor.calculate_average_per_channel(aerochrome)
-                print(f"Debug - aerochrome avg per channel: {avg_aerochrome}")
+                if self.options.verbose:
+                    avg_aerochrome = self.processor.calculate_average_per_channel(aerochrome)
+                    print(f"Debug - aerochrome avg per channel: {avg_aerochrome}")
             
-            print(f"Successfully processed: {os.path.basename(left_path)}")
+            # Step 5: Save final RGB and NIR images for training
+            if 'final' in output_dirs:
+                # Create subdirectories if they don't exist
+                rgb_final_dir = os.path.join(output_dirs['final'], 'rgb_png')
+                nir_final_dir = os.path.join(output_dirs['final'], 'nir_png')
+                os.makedirs(rgb_final_dir, exist_ok=True)
+                os.makedirs(nir_final_dir, exist_ok=True)
+                
+                # Get base filename without extension and remove '_ir' suffix if present
+                base_name = os.path.splitext(os.path.basename(left_path))[0]
+                if base_name.endswith('_ir'):
+                    base_name = base_name[:-3]
+                
+                # Save RGB (rect_right) and NIR (warped_left) as 16-bit PNGs
+                self.saver.save_as_png16(rect_right, os.path.join(rgb_final_dir, f"{base_name}.png"))
+                self.saver.save_as_png16(warped_left, os.path.join(nir_final_dir, f"{base_name}.png"))
+                
+                # Also save as NPY for reproducibility
+                os.makedirs(os.path.join(output_dirs['final'], 'rgb_npy'), exist_ok=True)
+                os.makedirs(os.path.join(output_dirs['final'], 'nir_npy'), exist_ok=True)
+                self.saver.save_as_npy(rect_right, os.path.join(output_dirs['final'], 'rgb_npy', f"{base_name}.npy"))
+                self.saver.save_as_npy(warped_left, os.path.join(output_dirs['final'], 'nir_npy', f"{base_name}.npy"))
+                
+                if self.options.verbose:
+                    print(f"Debug - saved final RGB and NIR images for {base_name}")
+            
+            if self.options.verbose:
+                print(f"Successfully processed: {os.path.basename(left_path)}")
             return True
             
         except Exception as e:
@@ -730,10 +931,19 @@ def main():
                        help='Minimum number of matches required')
     parser.add_argument('--debug', action='store_true',
                        help='Enable visual debugging')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose debug output')
     parser.add_argument('--benchmark', action='store_true',
                        help='Run benchmark instead of pipeline')
     parser.add_argument('--subset', type=int, default=None,
                        help='Number of image pairs to use for benchmark')
+    # DNG enhancement options
+    parser.add_argument('--no-dng-enhance', action='store_true',
+                       help='Disable DNG contrast enhancement')
+    parser.add_argument('--dng-brightness', type=float, default=1.2,
+                       help='DNG brightness multiplier (default: 1.2)')
+    parser.add_argument('--dng-exposure', type=float, default=0.3,
+                       help='DNG exposure shift (default: 0.3)')
 
     
     args = parser.parse_args()
@@ -745,7 +955,11 @@ def main():
         anms_num_keypoints=args.anms_keypoints,
         anms_suppression=args.anms_suppression,
         min_match_count=args.min_matches,
-        debug_visual=args.debug
+        debug_visual=args.debug,
+        verbose=args.verbose,
+        dng_enhance_contrast=not args.no_dng_enhance,
+        dng_brightness=args.dng_brightness,
+        dng_exposure_shift=args.dng_exposure
     )
     
     if args.benchmark:
@@ -754,10 +968,11 @@ def main():
     
     # Define output directories
     output_directories = {
-        'rectified': f"{args.input}/rectified",
-        'warped': f"{args.input}/warped",
-        'overlay': f"{args.input}/overlay",
-        'aerochrome': f"{args.input}/aerochrome"
+        'rectified': f"{args.input}/processed/rectified",
+        'warped': f"{args.input}/processed/warped",
+        'overlay': f"{args.input}/processed/overlay",
+        'aerochrome': f"{args.input}/processed/aerochrome",
+        'final': f"{args.input}/processed/final"
     }
     
     # Create and run pipeline
