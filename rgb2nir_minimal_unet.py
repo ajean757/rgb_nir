@@ -96,10 +96,12 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 \
 
 DATA STRUCTURES SUPPORTED:
 --------------------------
-1. Organized (recommended): data_root/originals/{rgb_jpg,nir_jpg}/
-2. Legacy (single folder): data_root/ with mixed *_rgb.* and *_ir.* files
+1. Flexible subdirectories (recommended): Auto-detects RGB/NIR subdirectories
+   data_root/rgb_png/ and data_root/nir_png/ (or any *rgb* and *nir*/*ir* named dirs)
+2. Legacy organized: data_root/originals/{rgb_jpg,nir_jpg}/
+3. Legacy flat: data_root/ with mixed *_rgb.* and *_ir.* files
 
-The script automatically detects and adapts to either structure.
+The script automatically detects and adapts to any structure.
 ```
 """
 
@@ -115,6 +117,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+from tqdm import tqdm
 
 # Import utility functions for directory organization
 try:
@@ -127,6 +130,52 @@ except ImportError:
 # -------------------------------
 #  Utility Functions for Data Management
 # -------------------------------
+def auto_detect_subdirectories(data_root: Path, verbose: bool = True):
+    """
+    Auto-detect RGB and NIR subdirectories in the data root.
+    
+    Args:
+        data_root: Path to the data directory
+        verbose: Whether to print detection details
+    
+    Returns:
+        tuple: (rgb_subdir_name, nir_subdir_name) or (None, None) if not found
+    """
+    data_root = Path(data_root)
+    
+    if not data_root.exists():
+        return None, None
+    
+    # Get all subdirectories
+    subdirs = [d for d in data_root.iterdir() if d.is_dir() and not d.name.startswith('.')]
+    
+    rgb_candidates = []
+    nir_candidates = []
+    
+    # Look for directories containing 'rgb' and 'nir'/'ir' in their names
+    for subdir in subdirs:
+        subdir_name_lower = subdir.name.lower()
+        
+        if 'rgb' in subdir_name_lower:
+            rgb_candidates.append(subdir.name)
+        elif 'nir' in subdir_name_lower or 'ir' in subdir_name_lower:
+            nir_candidates.append(subdir.name)
+    
+    # Select the best candidates
+    rgb_subdir = rgb_candidates[0] if rgb_candidates else None
+    nir_subdir = nir_candidates[0] if nir_candidates else None
+    
+    if verbose and rgb_subdir and nir_subdir:
+        print(f"Auto-detected subdirectories:")
+        print(f"  RGB: {rgb_subdir}")
+        print(f"  NIR: {nir_subdir}")
+    elif verbose:
+        print(f"Auto-detection results:")
+        print(f"  RGB candidates: {rgb_candidates}")
+        print(f"  NIR candidates: {nir_candidates}")
+    
+    return rgb_subdir, nir_subdir
+
 def setup_data_directory(data_root: Path, organize: bool = False, verbose: bool = True):
     """
     Set up and optionally organize the data directory.
@@ -179,15 +228,15 @@ def setup_data_directory(data_root: Path, organize: bool = False, verbose: bool 
     
     return data_root
 
-def validate_data_structure(data_root: Path, rgb_subdir: str = "rgb_jpg", 
-                          nir_subdir: str = "nir_jpg", verbose: bool = True):
+def validate_data_structure(data_root: Path, rgb_subdir: str = None, 
+                          nir_subdir: str = None, verbose: bool = True):
     """
     Validate that the data directory has the expected structure and files.
     
     Args:
         data_root: Path to the data directory
-        rgb_subdir: RGB subdirectory name
-        nir_subdir: NIR subdirectory name  
+        rgb_subdir: RGB subdirectory name (if None, auto-detect)
+        nir_subdir: NIR subdirectory name (if None, auto-detect)
         verbose: Whether to print validation details
     
     Returns:
@@ -199,47 +248,136 @@ def validate_data_structure(data_root: Path, rgb_subdir: str = "rgb_jpg",
         'rgb_count': 0,
         'nir_count': 0,
         'pair_count': 0,
-        'issues': []
+        'issues': [],
+        'rgb_subdir': None,
+        'nir_subdir': None
     }
     
     data_root = Path(data_root)
     
-    # Check for organized structure
-    originals_path = data_root / "originals"
-    if originals_path.exists():
-        rgb_dir = originals_path / rgb_subdir
-        nir_dir = originals_path / nir_subdir
+    # Auto-detect subdirectories if not provided
+    if rgb_subdir is None or nir_subdir is None:
+        detected_rgb, detected_nir = auto_detect_subdirectories(data_root, verbose=verbose)
+        rgb_subdir = rgb_subdir or detected_rgb
+        nir_subdir = nir_subdir or detected_nir
+    
+    # Store the detected/provided subdirectory names
+    result['rgb_subdir'] = rgb_subdir
+    result['nir_subdir'] = nir_subdir
+    
+    # Check for direct subdirectory structure (flexible)
+    if rgb_subdir and nir_subdir:
+        rgb_dir = data_root / rgb_subdir
+        nir_dir = data_root / nir_subdir
         
         if rgb_dir.exists() and nir_dir.exists():
-            result['structure_type'] = 'organized'
-            rgb_files = list(rgb_dir.glob("*_rgb.*"))
-            nir_files = list(nir_dir.glob("*_ir.*"))
+            result['structure_type'] = 'flexible_subdirs'
+            
+            # Look for any image files (flexible extensions)
+            image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+            
+            rgb_files = []
+            nir_files = []
+            
+            for ext in image_extensions:
+                rgb_files.extend(list(rgb_dir.glob(ext)))
+                rgb_files.extend(list(rgb_dir.glob(ext.upper())))
+                nir_files.extend(list(nir_dir.glob(ext)))
+                nir_files.extend(list(nir_dir.glob(ext.upper())))
             
             result['rgb_count'] = len(rgb_files)
             result['nir_count'] = len(nir_files)
             
-            # Check for pairs
+            # Check for pairs by matching filenames (remove rgb/nir/ir suffixes)
             pairs = 0
+            rgb_stems = set()
+            nir_stems = set()
+            
+            # Extract base names from RGB files
             for rgb_file in rgb_files:
-                stem = rgb_file.stem.replace("_rgb", "")
-                matching_nir = [f for f in nir_files if stem in f.stem]
-                if matching_nir:
-                    pairs += 1
-                else:
-                    result['issues'].append(f"No NIR pair for {rgb_file.name}")
+                stem = rgb_file.stem
+                # Remove common RGB suffixes
+                for suffix in ['_rgb', '_RGB', 'rgb', 'RGB']:
+                    if stem.endswith(suffix):
+                        stem = stem[:-len(suffix)]
+                        break
+                rgb_stems.add(stem)
+            
+            # Extract base names from NIR files  
+            for nir_file in nir_files:
+                stem = nir_file.stem
+                # Remove common NIR/IR suffixes
+                for suffix in ['_nir', '_NIR', '_ir', '_IR', 'nir', 'NIR', 'ir', 'IR']:
+                    if stem.endswith(suffix):
+                        stem = stem[:-len(suffix)]
+                        break
+                nir_stems.add(stem)
+            
+            # Count matching pairs
+            pairs = len(rgb_stems.intersection(nir_stems))
+            
+            # Report unpaired files
+            unpaired_rgb = rgb_stems - nir_stems
+            unpaired_nir = nir_stems - rgb_stems
+            
+            for stem in list(unpaired_rgb)[:3]:  # Show first 3
+                result['issues'].append(f"No NIR pair for RGB file with stem: {stem}")
+            if len(unpaired_rgb) > 3:
+                result['issues'].append(f"... and {len(unpaired_rgb) - 3} more unpaired RGB files")
+                
+            for stem in list(unpaired_nir)[:3]:  # Show first 3
+                result['issues'].append(f"No RGB pair for NIR file with stem: {stem}")
+            if len(unpaired_nir) > 3:
+                result['issues'].append(f"... and {len(unpaired_nir) - 3} more unpaired NIR files")
             
             result['pair_count'] = pairs
             result['valid'] = pairs > 0
         else:
-            result['issues'].append("Organized structure missing rgb_jpg or nir_jpg directories")
+            missing_dirs = []
+            if not rgb_dir.exists():
+                missing_dirs.append(f"RGB directory: {rgb_dir}")
+            if not nir_dir.exists():
+                missing_dirs.append(f"NIR directory: {nir_dir}")
+            result['issues'].append(f"Missing directories: {', '.join(missing_dirs)}")
     
-    # Check for legacy structure
+    # Check for legacy organized structure (backward compatibility)
+    if not result['valid']:
+        originals_path = data_root / "originals"
+        if originals_path.exists():
+            rgb_dir = originals_path / "rgb_jpg"
+            nir_dir = originals_path / "nir_jpg"
+            
+            if rgb_dir.exists() and nir_dir.exists():
+                result['structure_type'] = 'legacy_organized'
+                result['rgb_subdir'] = "originals/rgb_jpg"
+                result['nir_subdir'] = "originals/nir_jpg"
+                
+                rgb_files = list(rgb_dir.glob("*_rgb.*"))
+                nir_files = list(nir_dir.glob("*_ir.*"))
+                
+                result['rgb_count'] = len(rgb_files)
+                result['nir_count'] = len(nir_files)
+                
+                # Check for pairs
+                pairs = 0
+                for rgb_file in rgb_files:
+                    stem = rgb_file.stem.replace("_rgb", "")
+                    matching_nir = [f for f in nir_files if stem in f.stem]
+                    if matching_nir:
+                        pairs += 1
+                    else:
+                        result['issues'].append(f"No NIR pair for {rgb_file.name}")
+                
+                result['pair_count'] = pairs
+                result['valid'] = pairs > 0
+    
+    # Check for legacy flat structure
     if not result['valid']:
         rgb_files = list(data_root.glob("*_rgb.*"))
         nir_files = list(data_root.glob("*_ir.*"))
         
         if rgb_files and nir_files:
-            result['structure_type'] = 'legacy'
+            result['structure_type'] = 'legacy_flat'
             result['rgb_count'] = len(rgb_files)
             result['nir_count'] = len(nir_files)
             
@@ -261,6 +399,9 @@ def validate_data_structure(data_root: Path, rgb_subdir: str = "rgb_jpg",
     if verbose:
         print(f"Data validation for {data_root}:")
         print(f"  Structure: {result['structure_type']}")
+        if result['rgb_subdir'] and result['nir_subdir']:
+            print(f"  RGB directory: {result['rgb_subdir']}")
+            print(f"  NIR directory: {result['nir_subdir']}")
         print(f"  RGB files: {result['rgb_count']}")
         print(f"  NIR files: {result['nir_count']}")
         print(f"  Matched pairs: {result['pair_count']}")
@@ -280,20 +421,22 @@ def validate_data_structure(data_root: Path, rgb_subdir: str = "rgb_jpg",
 # -------------------------------
 class PairedRGBNIR(Dataset):
     """
-    Loads paired RGB / NIR image pairs from organized directory structure.
+    Loads paired RGB / NIR image pairs from flexible directory structures.
     
     DIRECTORY STRUCTURE SUPPORT:
     ---------------------------
-    This dataset class supports two directory organizations:
+    This dataset class supports multiple directory organizations:
     
-    1. Legacy (single folder): RGB and NIR images in same directory
+    1. Flexible subdirectories (recommended): Auto-detects RGB and NIR subdirs
        data_root/
-         ├── image1_rgb.jpg
-         ├── image1_ir.jpg
-         ├── image2_rgb.jpg
-         └── image2_ir.jpg
+         ├── rgb_png/        # or rgb_jpg, rgb_images, etc.
+         │   ├── image1.jpg
+         │   └── image2.jpg
+         └── nir_png/        # or nir_jpg, ir_images, etc.
+             ├── image1.jpg
+             └── image2.jpg
     
-    2. New organized structure (compatible with utils.py):
+    2. Legacy organized structure:
        data_root/
          └── originals/
              ├── rgb_jpg/
@@ -303,34 +446,41 @@ class PairedRGBNIR(Dataset):
                  ├── image1_ir.jpg
                  └── image2_ir.jpg
     
+    3. Legacy flat structure:
+       data_root/
+         ├── image1_rgb.jpg
+         ├── image1_ir.jpg
+         ├── image2_rgb.jpg
+         └── image2_ir.jpg
+    
     The class automatically detects which structure is being used.
     """
     def __init__(self, root: str | Path, size: int = 512, 
-                 rgb_subdir: str = "rgb_jpg", nir_subdir: str = "nir_jpg"):
+                 rgb_subdir: str = None, nir_subdir: str = None):
         self.dir = Path(root)
         self.size = size
         self.rgb_subdir = rgb_subdir
         self.nir_subdir = nir_subdir
         
-        # Try new organized structure first
-        originals_path = self.dir / "originals"
-        if originals_path.exists():
-            rgb_dir = originals_path / rgb_subdir
-            nir_dir = originals_path / nir_subdir
+        # Auto-detect if not provided
+        if not rgb_subdir or not nir_subdir:
+            detected_rgb, detected_nir = auto_detect_subdirectories(self.dir, verbose=True)
+            self.rgb_subdir = rgb_subdir or detected_rgb
+            self.nir_subdir = nir_subdir or detected_nir
+        
+        # Try flexible subdirectory structure first
+        if self.rgb_subdir and self.nir_subdir:
+            rgb_dir = self.dir / self.rgb_subdir
+            nir_dir = self.dir / self.nir_subdir
             
             if rgb_dir.exists() and nir_dir.exists():
-                self.rgb_files = sorted(rgb_dir.glob("*_rgb.jpg*"))
-                self.nir_dir = nir_dir
-                self.use_organized_structure = True
-                print(f"Using organized structure: {originals_path}")
+                self._setup_flexible_structure(rgb_dir, nir_dir)
             else:
-                # Fall back to legacy structure
-                self._setup_legacy_structure()
+                self._try_fallback_structures()
         else:
-            # Use legacy structure
-            self._setup_legacy_structure()
+            self._try_fallback_structures()
         
-        assert self.rgb_files, f"No '*_rgb.*' files found in search paths"
+        assert self.rgb_files, f"No RGB files found in search paths"
         
         # Build pairs
         self.pairs: List[Tuple[Path, Path]] = []
@@ -345,15 +495,95 @@ class PairedRGBNIR(Dataset):
             transforms.Lambda(lambda x: x * 2 - 1),  # [-1,1]
         ])
 
-    def _setup_legacy_structure(self):
-        """Set up for legacy single-folder structure"""
-        self.rgb_files = sorted(self.dir.glob("*_rgb.jpg*"))
-        self.nir_dir = self.dir
-        self.use_organized_structure = False
-        print(f"Using legacy structure: {self.dir}")
-    
+    def _setup_flexible_structure(self, rgb_dir: Path, nir_dir: Path):
+        """Set up for flexible subdirectory structure"""
+        # Get all image files from RGB directory
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+        self.rgb_files = []
+        
+        for ext in image_extensions:
+            self.rgb_files.extend(list(rgb_dir.glob(ext)))
+            self.rgb_files.extend(list(rgb_dir.glob(ext.upper())))
+        
+        self.rgb_files = sorted(self.rgb_files)
+        self.nir_dir = nir_dir
+        self.structure_type = 'flexible'
+        print(f"Using flexible structure: RGB={rgb_dir}, NIR={nir_dir}")
+
+    def _try_fallback_structures(self):
+        """Try legacy structures as fallback"""
+        # Try legacy organized structure
+        originals_path = self.dir / "originals"
+        if originals_path.exists():
+            rgb_dir = originals_path / "rgb_jpg"
+            nir_dir = originals_path / "nir_jpg"
+            
+            if rgb_dir.exists() and nir_dir.exists():
+                self.rgb_files = sorted(rgb_dir.glob("*_rgb.*"))
+                self.nir_dir = nir_dir
+                self.structure_type = 'legacy_organized'
+                print(f"Using legacy organized structure: {originals_path}")
+                return
+        
+        # Try legacy flat structure
+        rgb_files = list(self.dir.glob("*_rgb.*"))
+        if rgb_files:
+            self.rgb_files = sorted(rgb_files)
+            self.nir_dir = self.dir
+            self.structure_type = 'legacy_flat'
+            print(f"Using legacy flat structure: {self.dir}")
+            return
+        
+        # No structure found
+        self.rgb_files = []
+        self.nir_dir = None
+        self.structure_type = None
+
     def _build_pairs(self):
         """Build RGB-NIR pairs from available files"""
+        if self.structure_type == 'flexible':
+            self._build_flexible_pairs()
+        elif self.structure_type in ['legacy_organized', 'legacy_flat']:
+            self._build_legacy_pairs()
+    
+    def _build_flexible_pairs(self):
+        """Build pairs for flexible structure by matching base filenames"""
+        # Get all NIR files
+        image_extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.tif']
+        nir_files = []
+        
+        for ext in image_extensions:
+            nir_files.extend(list(self.nir_dir.glob(ext)))
+            nir_files.extend(list(self.nir_dir.glob(ext.upper())))
+        
+        # Create lookup dict for NIR files by base name
+        nir_lookup = {}
+        for nir_file in nir_files:
+            stem = nir_file.stem
+            # Remove common NIR/IR suffixes to get base name
+            for suffix in ['_nir', '_NIR', '_ir', '_IR', 'nir', 'NIR', 'ir', 'IR']:
+                if stem.endswith(suffix):
+                    stem = stem[:-len(suffix)]
+                    break
+            nir_lookup[stem] = nir_file
+        
+        # Match RGB files to NIR files
+        for rgb_file in self.rgb_files:
+            rgb_stem = rgb_file.stem
+            # Remove common RGB suffixes to get base name
+            for suffix in ['_rgb', '_RGB', 'rgb', 'RGB']:
+                if rgb_stem.endswith(suffix):
+                    rgb_stem = rgb_stem[:-len(suffix)]
+                    break
+            
+            # Look for matching NIR file
+            if rgb_stem in nir_lookup:
+                self.pairs.append((rgb_file, nir_lookup[rgb_stem]))
+            else:
+                print(f"Warning: No NIR pair found for RGB file: {rgb_file.name}")
+    
+    def _build_legacy_pairs(self):
+        """Build pairs for legacy structures using original logic"""
         for rgb_path in self.rgb_files:
             stem = rgb_path.stem.replace("_rgb", "")
             
@@ -655,7 +885,7 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
     """
     G.train(); D.train(); g_l = d_l = 0.0
     
-    for rgb, nir in loader:
+    for batch_idx, (rgb, nir) in enumerate(loader):
         rgb, nir = rgb.to(dev), nir.to(dev)
         
         # Train Discriminator
@@ -694,6 +924,7 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
         g_loss.backward()
         og.step()
         
+        # Update running losses
         g_l += g_loss.item()
         d_l += d_loss.item()
     
@@ -710,7 +941,16 @@ def main():
 DATA DIRECTORY STRUCTURES SUPPORTED:
 ====================================
 
-1. Organized structure (recommended):
+1. Flexible subdirectories (recommended - auto-detected):
+   data_root/
+     ├── rgb_png/          # Any directory containing 'rgb'
+     │   ├── image1.jpg
+     │   └── image2.jpg
+     └── nir_png/          # Any directory containing 'nir' or 'ir'
+         ├── image1.jpg
+         └── image2.jpg
+
+2. Legacy organized structure:
    data_root/
      └── originals/
          ├── rgb_jpg/
@@ -720,7 +960,7 @@ DATA DIRECTORY STRUCTURES SUPPORTED:
              ├── image1_ir.jpg
              └── image2_ir.jpg
 
-2. Legacy structure (single folder):
+3. Legacy flat structure:
    data_root/
      ├── image1_rgb.jpg
      ├── image1_ir.jpg
@@ -729,36 +969,42 @@ DATA DIRECTORY STRUCTURES SUPPORTED:
 
 EXAMPLES:
 ========
-# Basic training with organized data
-python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --epochs 100
+# Basic training with flexible structure (auto-detects rgb_png & nir_png)
+python rgb2nir_minimal_unet.py --data_root /path/to/final --epochs 100
 
-# Training with legacy data structure
-python rgb2nir_minimal_unet.py --data_root legacy_data/ --epochs 50
+# Resume training from a checkpoint
+python rgb2nir_minimal_unet.py --data_root /path/to/final --resume training_output/checkpoint_epoch_050.pt --epochs 100
+
+# Basic training with custom subdirectory names
+python rgb2nir_minimal_unet.py --data_root /path/to/data --rgb_subdir rgb_images --nir_subdir nir_images --epochs 50
+
+# Validate data structure without training
+python rgb2nir_minimal_unet.py --data_root /path/to/final --validate_only
+
+# Training with legacy organized structure
+python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --epochs 50
 
 # Organize unstructured data before training
 python rgb2nir_minimal_unet.py --data_root messy_data/ --organize --epochs 50
 
-# Validate data without training
-python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --validate_only
-
 # Ablation study - no gradient loss
-python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --lambda_grad 0.0
+python rgb2nir_minimal_unet.py --data_root /path/to/final --lambda_grad 0.0
 
 # High-resolution training
-python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --batch 4
+python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
         """)
     
     # Data arguments
     parser.add_argument('--data_root', required=True, 
-                       help='Path to data directory (supports organized or legacy structure)')
+                       help='Path to data directory (supports flexible subdirectory structure)')
     parser.add_argument('--organize', action='store_true',
                        help='Organize unstructured data using utils.py before training')
     parser.add_argument('--validate_only', action='store_true', 
                        help='Only validate data structure, do not train')
-    parser.add_argument('--rgb_subdir', default='rgb_jpg',
-                       help='RGB subdirectory name in organized structure (default: rgb_jpg)')
-    parser.add_argument('--nir_subdir', default='nir_jpg', 
-                       help='NIR subdirectory name in organized structure (default: nir_jpg)')
+    parser.add_argument('--rgb_subdir', default=None,
+                       help='RGB subdirectory name (auto-detected if not specified)')
+    parser.add_argument('--nir_subdir', default=None, 
+                       help='NIR subdirectory name (auto-detected if not specified)')
     
     # Training arguments
     parser.add_argument('--size', type=int, default=512, help='Image resolution for each side')
@@ -775,6 +1021,8 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --ba
                        help='Gradient loss weight (spatial consistency, set to 0 to disable)')
     
     # Checkpoint and output
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Path to checkpoint file to resume training from')
     parser.add_argument('--checkpoint_path', type=str, default=None,
                        help='Path to load/save model checkpoints')
     parser.add_argument('--output_dir', type=str, default='training_output',
@@ -846,15 +1094,15 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --ba
     ds = PairedRGBNIR(
         data_root, 
         size=args.size, 
-        rgb_subdir=args.rgb_subdir, 
-        nir_subdir=args.nir_subdir
+        rgb_subdir=validation_result.get('rgb_subdir'), 
+        nir_subdir=validation_result.get('nir_subdir')
     )
     loader = DataLoader(
         ds, 
         batch_size=args.batch, 
         shuffle=True, 
         pin_memory=True, 
-        num_workers=2
+        num_workers=0  # Fixed: avoid multiprocessing issues with lambda transforms
     )
 
     # Initialize models
@@ -864,16 +1112,57 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --ba
     # Optimizers
     og = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(0.5, 0.999))
     od = torch.optim.Adam(D.parameters(), lr=args.lr, betas=(0.5, 0.999))
+    
+    # Initialize training state
+    start_epoch = 1
+    
+    # Load checkpoint if resuming
+    if args.resume:
+        checkpoint_path = Path(args.resume)
+        if checkpoint_path.exists():
+            print(f"\nLoading checkpoint from: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            
+            # Load model states
+            G.load_state_dict(checkpoint['generator_state_dict'])
+            D.load_state_dict(checkpoint['discriminator_state_dict'])
+            
+            # Load optimizer states
+            og.load_state_dict(checkpoint['optimizer_g_state_dict'])
+            od.load_state_dict(checkpoint['optimizer_d_state_dict'])
+            
+            # Resume from next epoch
+            start_epoch = checkpoint['epoch'] + 1
+            
+            print(f"Resumed from epoch {checkpoint['epoch']}")
+            print(f"Continuing training from epoch {start_epoch}")
+            
+            # Validate checkpoint compatibility
+            if 'args' in checkpoint:
+                checkpoint_args = checkpoint['args']
+                if (checkpoint_args.size != args.size or 
+                    checkpoint_args.base_channels != args.base_channels):
+                    print("WARNING: Model architecture mismatch detected!")
+                    print(f"  Checkpoint: size={checkpoint_args.size}, base_channels={checkpoint_args.base_channels}")
+                    print(f"  Current: size={args.size}, base_channels={args.base_channels}")
+        else:
+            print(f"ERROR: Checkpoint file not found: {checkpoint_path}")
+            return 1
 
     print(f"\nModel Parameters:")
     print(f"  Generator: {sum(p.numel() for p in G.parameters()):,}")
     print(f"  Discriminator: {sum(p.numel() for p in D.parameters()):,}")
     
-    print(f"\nStarting training...")
+    if args.resume:
+        print(f"\nResuming training from epoch {start_epoch}...")
+    else:
+        print(f"\nStarting training from scratch...")
     print("-" * 60)
 
-    # Training loop
-    for e in range(1, args.epochs + 1):
+    # Training loop with epoch progress bar
+    epoch_pbar = tqdm(range(start_epoch, args.epochs + 1), desc="Epochs", ncols=100)
+    
+    for e in epoch_pbar:
         gl, dl = train_epoch(
             G, D, loader, og, od, device, 
             lambda_l1=args.lambda_l1, 
@@ -881,6 +1170,13 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --ba
             lambda_grad=args.lambda_grad
         )
         
+        # Update epoch progress bar with losses
+        epoch_pbar.set_postfix({
+            'G_loss': f'{gl:.4f}',
+            'D_loss': f'{dl:.4f}'
+        })
+        
+        # Print epoch summary
         print(f"Epoch {e:03d}/{args.epochs:03d} | G={gl:.4f} D={dl:.4f}")
         
         # Save checkpoint
@@ -899,3 +1195,7 @@ python rgb2nir_minimal_unet.py --data_root DATA/data_04_06_2025 --size 1024 --ba
 
     print("\nTraining completed!")
     return 0
+
+
+if __name__ == "__main__":
+    exit(main())

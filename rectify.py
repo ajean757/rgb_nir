@@ -546,8 +546,8 @@ class ImageAligner:
                 print(f"Debug - retry good matches after ratio test: {len(good_matches)}")
 
         if len(good_matches) < self.options.min_match_count:
-            if self.options.verbose:
-                print(f"Debug - insufficient matches: {len(good_matches)} < {self.options.min_match_count}")
+            # Always report insufficient matches, regardless of verbose mode
+            print(f"INSUFFICIENT MATCHES: Found {len(good_matches)}, need at least {self.options.min_match_count}")
             return None, None, None
 
         # Compute homography
@@ -557,8 +557,8 @@ class ImageAligner:
         H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
 
         if H is None:
-            if self.options.verbose:
-                print("Debug - homography computation failed")
+            # Always report homography computation failure, regardless of verbose mode
+            print("HOMOGRAPHY COMPUTATION FAILED - Unable to compute transformation matrix")
             return None, None, None
 
         # Apply transformation
@@ -585,6 +585,18 @@ class ImageAligner:
             # Check if alignment is acceptable
             is_acceptable = quality_checker.is_alignment_acceptable(quality_metrics)
             
+            # Always report quality assessment failures, regardless of verbose mode
+            if not is_acceptable:
+                print(f"QUALITY CHECK FAILED - Image alignment quality below thresholds")
+                print(f"  SSIM: {quality_metrics['ssim']:.3f} (threshold: ≥{self.options.quality_ssim_threshold:.3f})")
+                print(f"  NCC: {quality_metrics['ncc']:.3f} (threshold: ≥{self.options.quality_ncc_threshold:.3f})")
+                print(f"  Gradient Corr: {quality_metrics['gradient_corr']:.3f} (threshold: ≥{self.options.quality_gradient_threshold:.3f})")
+                print(f"  Homography Quality: {quality_metrics['homography_quality']:.3f} (threshold: ≥0.5)")
+                print(f"  Overall Score: {quality_metrics['overall_score']:.3f}")
+                print(f"  Inliers: {inlier_count} (min required: {self.options.quality_min_inliers})")
+                return None, None, None
+                
+            # Verbose mode still gets the acceptance message
             if self.options.verbose:
                 print(f"Debug - Quality metrics: SSIM={quality_metrics['ssim']:.3f}, "
                       f"NCC={quality_metrics['ncc']:.3f}, Grad={quality_metrics['gradient_corr']:.3f}, "
@@ -1171,6 +1183,8 @@ class RGBNIRPipeline:
         self.aligner = ImageAligner(options)
         self.processor = ImageProcessor()
         self.saver = ImageSaver()
+        # Track failed processing for summary reporting
+        self.failed_images = []
 
     def _load_camera_info(self, npz_path: str) -> Dict[str, Any]:
         """Load camera calibration and rectification parameters from NPZ file."""
@@ -1248,6 +1262,18 @@ class RGBNIRPipeline:
             result = self.aligner.align_images(rect_left, rect_right)
 
             if result[0] is None:
+                # Track failed image for summary reporting
+                left_name = os.path.basename(left_path)
+                right_name = os.path.basename(right_path)
+                print(f"ALIGNMENT FAILED: {left_name} + {right_name}")
+                
+                failure_reason = "Alignment failed (insufficient matches or quality check failed)"
+                self.failed_images.append({
+                    'left_path': left_path,
+                    'right_path': right_path,
+                    'reason': failure_reason
+                })
+                
                 if self.options.verbose:
                     print(f"Failed to align {os.path.basename(right_path)} to {os.path.basename(left_path)}")
                 return False
@@ -1314,6 +1340,13 @@ class RGBNIRPipeline:
             return True
 
         except Exception as e:
+            # Track failed image for summary reporting
+            error_reason = f"Exception during processing: {str(e)}"
+            self.failed_images.append({
+                'left_path': left_path,
+                'right_path': right_path,
+                'reason': error_reason
+            })
             print(f"Error processing {os.path.basename(left_path)}: {str(e)}")
             return False
 
@@ -1354,6 +1387,29 @@ class RGBNIRPipeline:
         self.saver.save_as_png16(aerochrome, os.path.join(output_dir, f"{base_name}_aerochrome.png"))
         self.saver.save_as_jpeg(aerochrome, os.path.join(output_dir, f"{base_name}_aerochrome.jpg"))
 
+    def print_processing_summary(self) -> None:
+        """Print a summary of failed image processing."""
+        if not self.failed_images:
+            print("\n" + "="*60)
+            print("PROCESSING SUMMARY: All images processed successfully!")
+            print("="*60)
+            return
+            
+        print("\n" + "="*60)
+        print("PROCESSING SUMMARY")
+        print("="*60)
+        print(f"Total failed images: {len(self.failed_images)}")
+        print("\nFailed image details:")
+        print("-" * 40)
+        
+        for i, failure in enumerate(self.failed_images, 1):
+            left_name = os.path.basename(failure['left_path'])
+            right_name = os.path.basename(failure['right_path'])
+            print(f"{i:2d}. {left_name} + {right_name}")
+            print(f"    Reason: {failure['reason']}")
+            
+        print("="*60)
+
     def process_dataset(self, input_dir: str, output_dirs: Dict[str, str], 
                        file_ext: Optional[str] = None, subset: Optional[int] = None) -> None:
         """
@@ -1390,6 +1446,9 @@ class RGBNIRPipeline:
                 successful += 1
 
         print(f"Successfully processed {successful} out of {len(pairs)} image pairs")
+        
+        # Print detailed summary of any failures
+        self.print_processing_summary()
 
 
 def main():
