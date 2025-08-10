@@ -17,11 +17,17 @@ Features:
 - Aerochrome false-color generation
 
 
-# Basic usage (with cropping enabled by default)
+# Basic usage (only saves final aligned images by default)
 python rectify.py
 
-# With custom options
-python rectify.py --input ./DATA/data_04_06_2025 --ext dng --debug --anms-keypoints 300
+# Save all intermediate processed images
+python rectify.py --save-all
+
+# Save specific intermediate images
+python rectify.py --save-overlay --save-aerochrome
+
+# With custom options and save all
+python rectify.py --input ./DATA/data_04_06_2025 --ext dng --debug --save-all
 
 # Disable ANMS
 python rectify.py --no-anms
@@ -44,12 +50,12 @@ from dataclasses import dataclass
 @dataclass
 class ProcessingOptions:
     """Configuration options for image processing."""
-    save_rectified: bool = True
-    save_warped: bool = True
-    save_overlay: bool = True
-    save_aerochrome: bool = True
+    save_rectified: bool = False
+    save_warped: bool = False
+    save_overlay: bool = False
+    save_aerochrome: bool = False
     use_gdi_sift: bool = False
-    use_anms: bool = True
+    use_anms: bool = False
     anms_num_keypoints: int = 500
     anms_suppression: float = 0.9
     min_match_count: int = 10
@@ -62,6 +68,14 @@ class ProcessingOptions:
     # Cropping options
     crop_to_valid_region: bool = True  # Enable cropping to remove black borders
     crop_preserve_ratio: float = 0.92  # Preserve at least 92% of pixels when cropping
+    # Quality control options
+    enable_quality_filter: bool = True  # Enable quality filtering of alignments
+    quality_ssim_threshold: float = 0.3  # Minimum SSIM score (0-1, higher is better)
+    quality_ncc_threshold: float = 0.2   # Minimum normalized cross-correlation (-1 to 1)
+    quality_gradient_threshold: float = 0.15  # Minimum gradient correlation (0-1)
+    quality_min_inliers: int = 50  # Minimum number of RANSAC inliers for good homography
+    # File format options
+    save_npy_files: bool = False  # Save numpy arrays (.npy files) - disabled by default to reduce file bloat
 
 
 class ImageLoader:
@@ -550,6 +564,39 @@ class ImageAligner:
         # Apply transformation
         aligned = cv2.warpPerspective(img_src, H, (img_dst.shape[1], img_dst.shape[0]))
 
+        # Quality assessment of alignment before proceeding
+        if self.options.enable_quality_filter:
+            inlier_count = int(mask.sum()) if mask is not None else 0
+            
+            # For quality assessment, use the images that will be used for final output
+            if self.options.crop_to_valid_region:
+                # Temporarily crop for quality assessment
+                crop_region = self._compute_adaptive_crop_region(aligned, self.options.crop_preserve_ratio)
+                aligned_temp, dst_temp = self._crop_images_to_valid_region(aligned, img_dst, crop_region)
+            else:
+                aligned_temp, dst_temp = aligned, img_dst
+            
+            # Evaluate alignment quality
+            quality_checker = AlignmentQualityChecker(self.options)
+            quality_metrics = quality_checker.evaluate_alignment_quality(
+                aligned_temp, dst_temp, H, inlier_count
+            )
+            
+            # Check if alignment is acceptable
+            is_acceptable = quality_checker.is_alignment_acceptable(quality_metrics)
+            
+            if self.options.verbose:
+                print(f"Debug - Quality metrics: SSIM={quality_metrics['ssim']:.3f}, "
+                      f"NCC={quality_metrics['ncc']:.3f}, Grad={quality_metrics['gradient_corr']:.3f}, "
+                      f"H_qual={quality_metrics['homography_quality']:.3f}, "
+                      f"Overall={quality_metrics['overall_score']:.3f}")
+                print(f"Debug - Alignment {'ACCEPTED' if is_acceptable else 'REJECTED'}")
+            
+            if not is_acceptable:
+                if self.options.verbose:
+                    print("Debug - Poor alignment quality, rejecting image pair")
+                return None, None, None
+
         # Optionally crop to valid region to remove black borders
         if self.options.crop_to_valid_region:
             # Use adaptive border detection that preserves specified ratio of pixels
@@ -805,6 +852,221 @@ class CameraRectifier:
         return img
 
 
+class AlignmentQualityChecker:
+    """Evaluates the quality of image alignment using multiple metrics."""
+    
+    def __init__(self, options: ProcessingOptions):
+        self.options = options
+        
+    def evaluate_alignment_quality(self, img1: np.ndarray, img2: np.ndarray, 
+                                 homography: np.ndarray, inlier_count: int) -> Dict[str, float]:
+        """
+        Evaluate alignment quality using multiple metrics.
+        
+        Args:
+            img1: First aligned image (warped IR)
+            img2: Second aligned image (reference RGB) 
+            homography: The computed homography matrix
+            inlier_count: Number of RANSAC inliers used for homography
+            
+        Returns:
+            Dictionary with quality metrics and overall score
+        """
+        # Convert to grayscale for some metrics
+        gray1 = self._to_grayscale(img1)
+        gray2 = self._to_grayscale(img2)
+        
+        metrics = {}
+        
+        # 1. SSIM (Structural Similarity Index)
+        metrics['ssim'] = self._compute_ssim(gray1, gray2)
+        
+        # 2. Normalized Cross Correlation
+        metrics['ncc'] = self._compute_ncc(gray1, gray2)
+        
+        # 3. Gradient Correlation (edge alignment)
+        metrics['gradient_corr'] = self._compute_gradient_correlation(gray1, gray2)
+        
+        # 4. Homography quality (based on inliers and matrix properties)
+        metrics['homography_quality'] = self._evaluate_homography_quality(homography, inlier_count)
+        
+        # 5. Mutual Information
+        metrics['mutual_info'] = self._compute_mutual_information(gray1, gray2)
+        
+        # 6. Overall quality score (weighted combination)
+        metrics['overall_score'] = self._compute_overall_score(metrics)
+        
+        return metrics
+    
+    def is_alignment_acceptable(self, metrics: Dict[str, float]) -> bool:
+        """
+        Determine if alignment quality meets acceptance thresholds.
+        
+        Args:
+            metrics: Dictionary of quality metrics
+            
+        Returns:
+            True if alignment is acceptable, False otherwise
+        """
+        if not self.options.enable_quality_filter:
+            return True
+            
+        # Check individual thresholds
+        checks = [
+            metrics['ssim'] >= self.options.quality_ssim_threshold,
+            metrics['ncc'] >= self.options.quality_ncc_threshold, 
+            metrics['gradient_corr'] >= self.options.quality_gradient_threshold,
+            metrics['homography_quality'] >= 0.5  # Internal threshold for homography
+        ]
+        
+        # Require at least 3 out of 4 metrics to pass (allows some tolerance)
+        passed_checks = sum(checks)
+        
+        # Also check overall score as a backup
+        overall_acceptable = metrics['overall_score'] >= 0.4
+        
+        return passed_checks >= 3 or overall_acceptable
+    
+    def _to_grayscale(self, img: np.ndarray) -> np.ndarray:
+        """Convert image to grayscale if needed."""
+        if img.ndim == 3:
+            return cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        return img.astype(np.float32)
+    
+    def _compute_ssim(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Compute Structural Similarity Index."""
+        try:
+            from skimage.metrics import structural_similarity
+            return structural_similarity(img1, img2, data_range=1.0)
+        except ImportError:
+            # Fallback implementation if scikit-image not available
+            return self._compute_ssim_fallback(img1, img2)
+    
+    def _compute_ssim_fallback(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Fallback SSIM implementation using OpenCV."""
+        # Simple SSIM approximation using means and variances
+        mu1 = cv2.GaussianBlur(img1, (11, 11), 1.5)
+        mu2 = cv2.GaussianBlur(img2, (11, 11), 1.5)
+        
+        mu1_sq = mu1 * mu1
+        mu2_sq = mu2 * mu2
+        mu1_mu2 = mu1 * mu2
+        
+        sigma1_sq = cv2.GaussianBlur(img1 * img1, (11, 11), 1.5) - mu1_sq
+        sigma2_sq = cv2.GaussianBlur(img2 * img2, (11, 11), 1.5) - mu2_sq
+        sigma12 = cv2.GaussianBlur(img1 * img2, (11, 11), 1.5) - mu1_mu2
+        
+        c1 = 0.01 ** 2
+        c2 = 0.03 ** 2
+        
+        ssim_map = ((2 * mu1_mu2 + c1) * (2 * sigma12 + c2)) / ((mu1_sq + mu2_sq + c1) * (sigma1_sq + sigma2_sq + c2))
+        return float(np.mean(ssim_map))
+    
+    def _compute_ncc(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Compute Normalized Cross Correlation."""
+        # Normalize images to zero mean
+        img1_norm = img1 - np.mean(img1)
+        img2_norm = img2 - np.mean(img2)
+        
+        # Compute correlation
+        correlation = np.sum(img1_norm * img2_norm)
+        
+        # Normalize by standard deviations
+        norm1 = np.sqrt(np.sum(img1_norm ** 2))
+        norm2 = np.sqrt(np.sum(img2_norm ** 2))
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        
+        return float(correlation / (norm1 * norm2))
+    
+    def _compute_gradient_correlation(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Compute correlation of image gradients (edge alignment)."""
+        # Compute gradients
+        grad1_x = cv2.Sobel(img1, cv2.CV_64F, 1, 0, ksize=3)
+        grad1_y = cv2.Sobel(img1, cv2.CV_64F, 0, 1, ksize=3)
+        grad1_mag = np.sqrt(grad1_x**2 + grad1_y**2)
+        
+        grad2_x = cv2.Sobel(img2, cv2.CV_64F, 1, 0, ksize=3)
+        grad2_y = cv2.Sobel(img2, cv2.CV_64F, 0, 1, ksize=3)
+        grad2_mag = np.sqrt(grad2_x**2 + grad2_y**2)
+        
+        # Compute correlation of gradient magnitudes
+        return self._compute_ncc(grad1_mag, grad2_mag)
+    
+    def _evaluate_homography_quality(self, homography: np.ndarray, inlier_count: int) -> float:
+        """Evaluate homography matrix quality."""
+        if homography is None:
+            return 0.0
+        
+        # Check if we have minimum inliers
+        inlier_score = min(1.0, inlier_count / self.options.quality_min_inliers)
+        
+        # Check homography matrix properties
+        try:
+            # Compute condition number (lower is better, but we want 0-1 score)
+            cond_num = np.linalg.cond(homography)
+            cond_score = 1.0 / (1.0 + cond_num / 100.0)  # Normalize to 0-1
+            
+            # Check determinant (should be positive and reasonable)
+            det = np.linalg.det(homography[:2, :2])  # 2x2 submatrix
+            det_score = 1.0 if 0.1 <= abs(det) <= 10.0 else 0.5
+            
+            # Average the scores
+            matrix_quality = (cond_score + det_score) / 2.0
+            
+        except np.linalg.LinAlgError:
+            matrix_quality = 0.0
+        
+        # Combine inlier and matrix quality
+        return (inlier_score + matrix_quality) / 2.0
+    
+    def _compute_mutual_information(self, img1: np.ndarray, img2: np.ndarray) -> float:
+        """Compute Mutual Information between images."""
+        # Convert to integer histograms
+        img1_int = (img1 * 255).astype(np.uint8)
+        img2_int = (img2 * 255).astype(np.uint8)
+        
+        # Compute joint histogram
+        hist_2d, _, _ = np.histogram2d(img1_int.ravel(), img2_int.ravel(), bins=64)
+        
+        # Smooth to avoid log(0)
+        hist_2d += 1e-10
+        
+        # Normalize to get joint probability
+        pxy = hist_2d / float(np.sum(hist_2d))
+        
+        # Marginal probabilities
+        px = np.sum(pxy, axis=1)
+        py = np.sum(pxy, axis=0)
+        
+        # Compute mutual information
+        px_py = px[:, None] * py[None, :]
+        nzs = pxy > 0  # Non-zero elements
+        
+        mi = np.sum(pxy[nzs] * np.log(pxy[nzs] / px_py[nzs]))
+        
+        # Normalize to 0-1 range (approximate)
+        return float(np.clip(mi / 2.0, 0, 1))
+    
+    def _compute_overall_score(self, metrics: Dict[str, float]) -> float:
+        """Compute weighted overall quality score."""
+        weights = {
+            'ssim': 0.3,
+            'ncc': 0.2, 
+            'gradient_corr': 0.2,
+            'homography_quality': 0.2,
+            'mutual_info': 0.1
+        }
+        
+        score = 0.0
+        for metric, weight in weights.items():
+            if metric in metrics:
+                score += weight * max(0, metrics[metric])  # Ensure non-negative
+        
+        return score
+
+
 class ImageProcessor:
     """Handles various image processing operations."""
 
@@ -1036,11 +1298,12 @@ class RGBNIRPipeline:
                 self.saver.save_as_png16(rect_right_cropped, os.path.join(rgb_final_dir, f"{base_name}.png"))
                 self.saver.save_as_png16(warped_left, os.path.join(nir_final_dir, f"{base_name}.png"))
 
-                # Also save as NPY for reproducibility
-                os.makedirs(os.path.join(output_dirs['final'], 'rgb_npy'), exist_ok=True)
-                os.makedirs(os.path.join(output_dirs['final'], 'nir_npy'), exist_ok=True)
-                self.saver.save_as_npy(rect_right_cropped, os.path.join(output_dirs['final'], 'rgb_npy', f"{base_name}.npy"))
-                self.saver.save_as_npy(warped_left, os.path.join(output_dirs['final'], 'nir_npy', f"{base_name}.npy"))
+                # Optionally save as NPY for reproducibility (disabled by default to reduce file bloat)
+                if self.options.save_npy_files:
+                    os.makedirs(os.path.join(output_dirs['final'], 'rgb_npy'), exist_ok=True)
+                    os.makedirs(os.path.join(output_dirs['final'], 'nir_npy'), exist_ok=True)
+                    self.saver.save_as_npy(rect_right_cropped, os.path.join(output_dirs['final'], 'rgb_npy', f"{base_name}.npy"))
+                    self.saver.save_as_npy(warped_left, os.path.join(output_dirs['final'], 'nir_npy', f"{base_name}.npy"))
 
                 if self.options.verbose:
                     print(f"Debug - saved final RGB and NIR images for {base_name}")
@@ -1064,9 +1327,10 @@ class RGBNIRPipeline:
         self.saver.save_as_png16(rect_left, os.path.join(output_dir, f"{left_name}_rect.png"))
         self.saver.save_as_png16(rect_right, os.path.join(output_dir, f"{right_name}_rect.png"))
 
-        # Save as NPY for reproducibility
-        self.saver.save_as_npy(rect_left, os.path.join(output_dir, f"{left_name}_rect.npy"))
-        self.saver.save_as_npy(rect_right, os.path.join(output_dir, f"{right_name}_rect.npy"))
+        # Optionally save as NPY for reproducibility (disabled by default to reduce file bloat)
+        if self.options.save_npy_files:
+            self.saver.save_as_npy(rect_left, os.path.join(output_dir, f"{left_name}_rect.npy"))
+            self.saver.save_as_npy(rect_right, os.path.join(output_dir, f"{right_name}_rect.npy"))
 
     def _save_warped_image(self, left_path: str, warped_left: np.ndarray, output_dir: str) -> None:
         """Save warped image in multiple formats."""
@@ -1166,12 +1430,76 @@ def main():
                        help='Disable cropping to valid region (may result in black borders)')
     parser.add_argument('--crop-preserve-ratio', type=float, default=0.92,
                        help='Minimum ratio of pixels to preserve when cropping (default: 0.92 = 92%%)')
+    # Quality control options
+    parser.add_argument('--no-quality-filter', action='store_true',
+                       help='Disable quality filtering of alignments')
+    parser.add_argument('--quality-ssim-threshold', type=float, default=0.3,
+                       help='Minimum SSIM score for acceptable alignment (default: 0.3)')
+    parser.add_argument('--quality-ncc-threshold', type=float, default=0.2,
+                       help='Minimum normalized cross-correlation for acceptable alignment (default: 0.2)')
+    parser.add_argument('--quality-gradient-threshold', type=float, default=0.15,
+                       help='Minimum gradient correlation for acceptable alignment (default: 0.15)')
+    parser.add_argument('--quality-min-inliers', type=int, default=50,
+                       help='Minimum RANSAC inliers for good homography (default: 50)')
+    
+    # Save options - individual flags
+    parser.add_argument('--save-rectified', action='store_true',
+                       help='Save rectified images')
+    parser.add_argument('--save-warped', action='store_true',
+                       help='Save warped (aligned) images')
+    parser.add_argument('--save-overlay', action='store_true',
+                       help='Save overlay images (RGB+NIR blend)')
+    parser.add_argument('--save-aerochrome', action='store_true',
+                       help='Save aerochrome false-color images')
+    
+    # Save options - convenience flags
+    parser.add_argument('--save-all', action='store_true',
+                       help='Enable all save options (rectified, warped, overlay, aerochrome)')
+    parser.add_argument('--save-none', action='store_true',
+                       help='Disable all save options (only save final aligned images)')
+    
+    # File format options
+    parser.add_argument('--save-npy', action='store_true',
+                       help='Save numpy arrays (.npy files) for reproducibility (increases file size significantly)')
 
 
     args = parser.parse_args()
+    
+    # Check for conflicting save flags
+    if args.save_all and args.save_none:
+        parser.error("Cannot use both --save-all and --save-none at the same time")
 
     # Configure processing options
+    
+    # Handle save option logic
+    save_rectified = args.save_rectified
+    save_warped = args.save_warped
+    save_overlay = args.save_overlay
+    save_aerochrome = args.save_aerochrome
+    
+    # Apply convenience flags first
+    if args.save_all:
+        save_rectified = save_warped = save_overlay = save_aerochrome = True
+    elif args.save_none:
+        save_rectified = save_warped = save_overlay = save_aerochrome = False
+    
+    # Individual flags can override convenience flags
+    if args.save_rectified:
+        save_rectified = True
+    if args.save_warped:
+        save_warped = True
+    if args.save_overlay:
+        save_overlay = True
+    if args.save_aerochrome:
+        save_aerochrome = True
+    
     options = ProcessingOptions(
+        # Save options
+        save_rectified=save_rectified,
+        save_warped=save_warped,
+        save_overlay=save_overlay,
+        save_aerochrome=save_aerochrome,
+        # Other options
         use_gdi_sift=args.gdi_sift,
         use_anms= args.anms,
         anms_num_keypoints=args.anms_keypoints,
@@ -1183,7 +1511,15 @@ def main():
         dng_brightness=args.dng_brightness,
         dng_exposure_shift=args.dng_exposure,
         crop_to_valid_region=not args.no_crop,
-        crop_preserve_ratio=args.crop_preserve_ratio
+        crop_preserve_ratio=args.crop_preserve_ratio,
+        # Quality control options
+        enable_quality_filter=not args.no_quality_filter,
+        quality_ssim_threshold=args.quality_ssim_threshold,
+        quality_ncc_threshold=args.quality_ncc_threshold,
+        quality_gradient_threshold=args.quality_gradient_threshold,
+        quality_min_inliers=args.quality_min_inliers,
+        # File format options
+        save_npy_files=args.save_npy
     )
 
     if args.benchmark:
