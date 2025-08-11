@@ -885,7 +885,10 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
     """
     G.train(); D.train(); g_l = d_l = 0.0
     
-    for batch_idx, (rgb, nir) in enumerate(loader):
+    # Add batch-level progress bar
+    batch_pbar = tqdm(enumerate(loader), total=len(loader), desc="Batches", leave=False)
+    
+    for batch_idx, (rgb, nir) in batch_pbar:
         rgb, nir = rgb.to(dev), nir.to(dev)
         
         # Train Discriminator
@@ -927,6 +930,13 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
         # Update running losses
         g_l += g_loss.item()
         d_l += d_loss.item()
+        
+        # Update batch progress bar with current losses
+        batch_pbar.set_postfix({
+            'G_loss': f'{g_loss.item():.4f}',
+            'D_loss': f'{d_loss.item():.4f}',
+            'Batch': f'{batch_idx+1}/{len(loader)}'
+        })
     
     return g_l/len(loader), d_l/len(loader)
 
