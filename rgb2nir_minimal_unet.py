@@ -1376,7 +1376,7 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     # Load best model for evaluation
     best_path = output_dir / 'best_model.pt'
     if best_path.exists():
-        checkpoint = torch.load(best_path, map_location=device)
+        checkpoint = torch.load(best_path, map_location=device, weights_only=False)
         G.load_state_dict(checkpoint['generator_state_dict'])
         print(f"Loaded best model from epoch {checkpoint['epoch']} for evaluation")
     
