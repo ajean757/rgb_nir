@@ -110,11 +110,12 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple
 import os
+import random
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
@@ -843,6 +844,55 @@ def adv_loss(pred_list, real: bool):
     
     return loss / len(pred_list)  # Average across scales
 
+def evaluate_model(model, test_loader, device, lambda_l1=100.0, lambda_ssim=10.0, lambda_grad=10.0):
+    """
+    Evaluate model performance on the test set.
+    
+    Args:
+        model: Generator model to evaluate
+        test_loader: DataLoader for test dataset
+        device: Device to run evaluation on
+        lambda_l1, lambda_ssim, lambda_grad: Loss weights
+        
+    Returns:
+        dict: Dictionary of evaluation metrics
+    """
+    model.eval()
+    metrics = {
+        'test_loss': 0.0,
+        'test_l1': 0.0,
+        'test_ssim': 0.0,
+        'test_grad': 0.0,
+    }
+    
+    with torch.no_grad():
+        for rgb, nir in tqdm(test_loader, desc="Evaluating", leave=False):
+            rgb, nir = rgb.to(device), nir.to(device)
+            fake = model(rgb)
+            
+            # Calculate metrics
+            l1_loss = F.l1_loss(fake, nir)
+            ssim_score = ssim(fake, nir)
+            grad_loss = gradient_loss(fake, nir)
+            
+            # Composite loss
+            total_loss = (lambda_l1 * l1_loss + 
+                        lambda_ssim * (1 - ssim_score) + 
+                        lambda_grad * grad_loss)
+            
+            # Accumulate metrics
+            metrics['test_loss'] += total_loss.item()
+            metrics['test_l1'] += l1_loss.item()
+            metrics['test_ssim'] += ssim_score.item()
+            metrics['test_grad'] += grad_loss.item()
+    
+    # Average metrics
+    for k in metrics:
+        metrics[k] /= len(test_loader)
+    
+    return metrics
+
+
 def feature_matching_loss(real_features, fake_features):
     """Feature matching loss between real and fake features"""
     loss = 0.0
@@ -1040,11 +1090,16 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     parser.add_argument('--save_freq', type=int, default=10,
                        help='Save checkpoint every N epochs')
     
+    parser.add_argument('--test_size', type=float, default=0.1,
+                       help='Percentage of data to use for testing (default: 0.1 or 10%%)')
+    parser.add_argument('--val_size', type=float, default=0.1,
+                       help='Percentage of data to use for validation (default: 0.1 or 10%%)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducible train/val/test splits')
+    
     # Model architecture options  
     parser.add_argument('--base_channels', type=int, default=64,
                        help='Base number of channels in U-Net')
-    parser.add_argument('--disable_spectral_norm', action='store_true',
-                       help='Disable spectral normalization in discriminator')
     
     args = parser.parse_args()
 
@@ -1101,23 +1156,62 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     print(f"  Device: {device}")
     
     # Create dataset and dataloader
-    ds = PairedRGBNIR(
+    full_dataset = PairedRGBNIR(
         data_root, 
         size=args.size, 
         rgb_subdir=validation_result.get('rgb_subdir'), 
         nir_subdir=validation_result.get('nir_subdir')
     )
-    loader = DataLoader(
-        ds, 
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+    
+    # Calculate sizes for train/val/test splits
+    dataset_size = len(full_dataset)
+    test_size = int(dataset_size * args.test_size)
+    val_size = int(dataset_size * args.val_size)
+    train_size = dataset_size - test_size - val_size
+    
+    # Split the dataset
+    train_dataset, val_dataset, test_dataset = random_split(
+        full_dataset, [train_size, val_size, test_size]
+    )
+    
+    print(f"Dataset split:")
+    print(f"  Total pairs: {dataset_size}")
+    print(f"  Training:   {train_size} pairs ({train_size/dataset_size:.1%})")
+    print(f"  Validation: {val_size} pairs ({val_size/dataset_size:.1%})")
+    print(f"  Test:       {test_size} pairs ({test_size/dataset_size:.1%})")
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset, 
         batch_size=args.batch, 
         shuffle=True, 
         pin_memory=True, 
         num_workers=0  # Fixed: avoid multiprocessing issues with lambda transforms
     )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=0
+    )
 
     # Initialize models
     G = GeneratorUNet(base=args.base_channels).to(device)
-    D = MultiScaleDiscriminator(use_spectral_norm=not args.disable_spectral_norm).to(device)
+    D = MultiScaleDiscriminator(use_spectral_norm=True).to(device)
     
     # Optimizers
     og = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(0.5, 0.999))
@@ -1172,25 +1266,96 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     # Training loop with epoch progress bar
     epoch_pbar = tqdm(range(start_epoch, args.epochs + 1), desc="Epochs", ncols=100)
     
+    best_val_loss = float('inf')
+    
     for e in epoch_pbar:
+        # Training phase
+        G.train()
+        D.train()
         gl, dl = train_epoch(
-            G, D, loader, og, od, device, 
+            G, D, train_loader, og, od, device, 
             lambda_l1=args.lambda_l1, 
             lambda_ssim=args.lambda_ssim, 
             lambda_grad=args.lambda_grad
         )
         
+        # Validation phase
+        G.eval()
+        D.eval()
+        val_g_loss = 0.0
+        val_ssim_score = 0.0
+        
+        with torch.no_grad():
+            for rgb, nir in val_loader:
+                rgb, nir = rgb.to(device), nir.to(device)
+                fake = G(rgb)
+                
+                # Calculate validation losses
+                l1_loss = F.l1_loss(fake, nir)
+                ssim_score = ssim(fake, nir)
+                grad_loss = gradient_loss(fake, nir)
+                
+                # Composite loss - same weighting as training
+                val_loss = (args.lambda_l1 * l1_loss + 
+                          args.lambda_ssim * (1 - ssim_score) + 
+                          args.lambda_grad * grad_loss)
+                
+                val_g_loss += val_loss.item()
+                val_ssim_score += ssim_score.item()
+        
+        val_g_loss /= len(val_loader)
+        val_ssim_score /= len(val_loader)
+        
+        is_best = val_g_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_g_loss
+        
         # Update epoch progress bar with losses
         epoch_pbar.set_postfix({
             'G_loss': f'{gl:.4f}',
-            'D_loss': f'{dl:.4f}'
+            'D_loss': f'{dl:.4f}',
+            'Val_loss': f'{val_g_loss:.4f}',
+            'Val_SSIM': f'{val_ssim_score:.4f}'
         })
         
         # Print epoch summary
-        print(f"Epoch {e:03d}/{args.epochs:03d} | G={gl:.4f} D={dl:.4f}")
+        print(f"Epoch {e:03d}/{args.epochs:03d} | Train G={gl:.4f} D={dl:.4f} | Val loss={val_g_loss:.4f} SSIM={val_ssim_score:.4f}")
         
         # Save checkpoint
-        if e % args.save_freq == 0 or e == args.epochs:
+        if e % args.save_freq == 0 or e == args.epochs or is_best:
+            checkpoint_path = output_dir / f'checkpoint_epoch_{e:03d}.pt'
+            
+            # Save additional info for best model
+            if is_best:
+                best_path = output_dir / 'best_model.pt'
+                print(f"New best model! Saving to {best_path}")
+                
+            torch.save({
+                'epoch': e,
+                'generator_state_dict': G.state_dict(),
+                'discriminator_state_dict': D.state_dict(),
+                'optimizer_g_state_dict': og.state_dict(),
+                'optimizer_d_state_dict': od.state_dict(),
+                'val_loss': val_g_loss,
+                'val_ssim': val_ssim_score,
+                'is_best': is_best,
+                'args': args,
+                'validation_result': validation_result
+            }, checkpoint_path)
+            print(f"Saved checkpoint: {checkpoint_path}")
+            
+            if is_best:
+                torch.save({
+                    'epoch': e,
+                    'generator_state_dict': G.state_dict(),
+                    'discriminator_state_dict': D.state_dict(),
+                    'optimizer_g_state_dict': og.state_dict(),
+                    'optimizer_d_state_dict': od.state_dict(),
+                    'val_loss': val_g_loss,
+                    'val_ssim': val_ssim_score,
+                    'args': args,
+                    'validation_result': validation_result
+                }, best_path)
             checkpoint_path = output_dir / f'checkpoint_epoch_{e:03d}.pt'
             torch.save({
                 'epoch': e,
@@ -1204,6 +1369,40 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
             print(f"Saved checkpoint: {checkpoint_path}")
 
     print("\nTraining completed!")
+    
+    # Evaluate on test set
+    print("\nEvaluating on test set...")
+    
+    # Load best model for evaluation
+    best_path = output_dir / 'best_model.pt'
+    if best_path.exists():
+        checkpoint = torch.load(best_path, map_location=device)
+        G.load_state_dict(checkpoint['generator_state_dict'])
+        print(f"Loaded best model from epoch {checkpoint['epoch']} for evaluation")
+    
+    # Run evaluation
+    test_metrics = evaluate_model(
+        G, test_loader, device,
+        lambda_l1=args.lambda_l1, 
+        lambda_ssim=args.lambda_ssim,
+        lambda_grad=args.lambda_grad
+    )
+    
+    # Print evaluation results
+    print("\nTest Set Results:")
+    print(f"  Total Loss: {test_metrics['test_loss']:.4f}")
+    print(f"  L1 Loss:    {test_metrics['test_l1']:.4f}")
+    print(f"  SSIM:       {test_metrics['test_ssim']:.4f}")
+    print(f"  Grad Loss:  {test_metrics['test_grad']:.4f}")
+    
+    # Save test results
+    results_path = output_dir / 'test_results.txt'
+    with open(results_path, 'w') as f:
+        f.write("Test Set Results:\n")
+        for metric, value in test_metrics.items():
+            f.write(f"{metric}: {value:.6f}\n")
+    
+    print(f"Test results saved to {results_path}")
     return 0
 
 
