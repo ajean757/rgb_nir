@@ -111,6 +111,8 @@ from pathlib import Path
 from typing import List, Tuple
 import os
 import random
+import csv
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -127,6 +129,127 @@ try:
 except ImportError:
     UTILS_AVAILABLE = False
     print("Warning: utils.py not found. Directory organization features disabled.")
+
+# -------------------------------
+#  Training Logger for Loss Tracking
+# -------------------------------
+class TrainingLogger:
+    """
+    Comprehensive training logger for tracking GAN training metrics.
+    
+    Logs per-epoch metrics to CSV files for later analysis and plotting.
+    Tracks generator losses, discriminator losses, validation metrics, and timing.
+    """
+    def __init__(self, output_dir: Path, run_name: str = None):
+        self.output_dir = output_dir
+        self.run_name = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create logs directory
+        self.logs_dir = output_dir / 'logs'
+        self.logs_dir.mkdir(exist_ok=True)
+        
+        # CSV file paths
+        self.train_log_path = self.logs_dir / f'training_log_{self.run_name}.csv'
+        self.batch_log_path = self.logs_dir / f'batch_log_{self.run_name}.csv'
+        
+        # Initialize CSV files with headers
+        self._init_csv_files()
+        
+        # In-memory storage for current epoch
+        self.current_epoch_batches = []
+        
+    def _init_csv_files(self):
+        """Initialize CSV files with appropriate headers"""
+        # Training log (per epoch)
+        train_headers = [
+            'epoch', 'timestamp', 'train_g_loss', 'train_d_loss', 
+            'train_g_loss_adv', 'train_g_loss_l1', 'train_g_loss_ssim', 'train_g_loss_grad',
+            'val_loss', 'val_l1', 'val_ssim', 'val_grad', 'val_ssim_score',
+            'is_best_epoch', 'epoch_time_minutes', 'learning_rate'
+        ]
+        
+        with open(self.train_log_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(train_headers)
+            
+        # Batch log (per batch - optional, for detailed analysis)
+        batch_headers = [
+            'epoch', 'batch', 'g_loss', 'd_loss', 'g_loss_adv', 
+            'l1_loss', 'ssim_loss', 'grad_loss', 'batch_time_seconds'
+        ]
+        
+        with open(self.batch_log_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(batch_headers)
+    
+    def log_batch(self, epoch: int, batch_idx: int, metrics: dict, batch_time: float = None):
+        """Log metrics for a single batch"""
+        batch_data = {
+            'epoch': epoch,
+            'batch': batch_idx,
+            'g_loss': metrics.get('g_loss', 0),
+            'd_loss': metrics.get('d_loss', 0),
+            'g_loss_adv': metrics.get('g_loss_adv', 0),
+            'l1_loss': metrics.get('l1_loss', 0),
+            'ssim_loss': metrics.get('ssim_loss', 0),
+            'grad_loss': metrics.get('grad_loss', 0),
+            'batch_time_seconds': batch_time or 0
+        }
+        
+        # Store for epoch averaging
+        self.current_epoch_batches.append(batch_data)
+        
+        # Write to batch log
+        with open(self.batch_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                batch_data['epoch'], batch_data['batch'], batch_data['g_loss'],
+                batch_data['d_loss'], batch_data['g_loss_adv'], batch_data['l1_loss'],
+                batch_data['ssim_loss'], batch_data['grad_loss'], batch_data['batch_time_seconds']
+            ])
+    
+    def log_epoch(self, epoch: int, train_metrics: dict, val_metrics: dict, 
+                  is_best: bool, epoch_time: float, lr: float):
+        """Log metrics for a complete epoch"""
+        timestamp = datetime.now().isoformat()
+        
+        # Calculate detailed training metrics from batch data
+        if self.current_epoch_batches:
+            avg_g_loss_adv = sum(b['g_loss_adv'] for b in self.current_epoch_batches) / len(self.current_epoch_batches)
+            avg_l1_loss = sum(b['l1_loss'] for b in self.current_epoch_batches) / len(self.current_epoch_batches)
+            avg_ssim_loss = sum(b['ssim_loss'] for b in self.current_epoch_batches) / len(self.current_epoch_batches)
+            avg_grad_loss = sum(b['grad_loss'] for b in self.current_epoch_batches) / len(self.current_epoch_batches)
+        else:
+            avg_g_loss_adv = avg_l1_loss = avg_ssim_loss = avg_grad_loss = 0
+        
+        epoch_data = [
+            epoch, timestamp,
+            train_metrics.get('g_loss', 0), train_metrics.get('d_loss', 0),
+            avg_g_loss_adv, avg_l1_loss, avg_ssim_loss, avg_grad_loss,
+            val_metrics.get('val_loss', 0), val_metrics.get('val_l1', 0),
+            val_metrics.get('val_ssim', 0), val_metrics.get('val_grad', 0),
+            val_metrics.get('val_ssim_score', 0),
+            is_best, epoch_time / 60.0, lr  # Convert time to minutes
+        ]
+        
+        # Write to training log
+        with open(self.train_log_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(epoch_data)
+        
+        # Clear batch data for next epoch
+        self.current_epoch_batches = []
+        
+        # Print summary
+        print(f"Logged epoch {epoch} - G: {train_metrics.get('g_loss', 0):.4f}, "
+              f"D: {train_metrics.get('d_loss', 0):.4f}, Val: {val_metrics.get('val_loss', 0):.4f}")
+    
+    def get_log_paths(self):
+        """Return paths to the log files for user reference"""
+        return {
+            'training_log': str(self.train_log_path),
+            'batch_log': str(self.batch_log_path)
+        }
 
 # -------------------------------
 #  Utility Functions for Data Management
@@ -900,7 +1023,7 @@ def feature_matching_loss(real_features, fake_features):
         loss += F.l1_loss(fake_feat, real_feat.detach())
     return loss / len(real_features)
 
-def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, lambda_grad=10.0):
+def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, lambda_grad=10.0, logger=None, epoch=None):
     """
     Single epoch training with multi-scale adversarial loss.
     
@@ -933,12 +1056,19 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
     - Multi-Scale Discriminator: O(3×H×W×C×K²) [3 scales]
     - Total Memory: ~11GB for 512×512 images with batch_size=16
     """
-    G.train(); D.train(); g_l = d_l = 0.0
+    import time
+    
+    G.train(); D.train()
+    
+    # Accumulators for epoch-level metrics
+    total_g_loss = total_d_loss = 0.0
+    total_g_loss_adv = total_l1_loss = total_ssim_loss = total_grad_loss = 0.0
     
     # Add batch-level progress bar
     batch_pbar = tqdm(enumerate(loader), total=len(loader), desc="Batches", leave=False)
     
     for batch_idx, (rgb, nir) in batch_pbar:
+        batch_start_time = time.time()
         rgb, nir = rgb.to(dev), nir.to(dev)
         
         # Train Discriminator
@@ -968,27 +1098,57 @@ def train_epoch(G, D, loader, og, od, dev, lambda_l1=100.0, lambda_ssim=10.0, la
         
         # Pixel-wise losses
         l1_loss = F.l1_loss(fake, nir)
-        ssim_loss = 1 - ssim(fake, nir)
-        grad_loss = gradient_loss(fake, nir)
+        ssim_loss_val = 1 - ssim(fake, nir)
+        grad_loss_val = gradient_loss(fake, nir)
         
         # Total generator loss
-        g_loss = g_loss_adv + lambda_l1 * l1_loss + lambda_ssim * ssim_loss + lambda_grad * grad_loss
+        g_loss = g_loss_adv + lambda_l1 * l1_loss + lambda_ssim * ssim_loss_val + lambda_grad * grad_loss_val
         
         g_loss.backward()
         og.step()
         
+        # Calculate batch time
+        batch_time = time.time() - batch_start_time
+        
         # Update running losses
-        g_l += g_loss.item()
-        d_l += d_loss.item()
+        total_g_loss += g_loss.item()
+        total_d_loss += d_loss.item()
+        total_g_loss_adv += g_loss_adv.item()
+        total_l1_loss += l1_loss.item()
+        total_ssim_loss += ssim_loss_val.item()
+        total_grad_loss += grad_loss_val.item()
+        
+        # Log batch metrics if logger provided
+        if logger and epoch is not None:
+            batch_metrics = {
+                'g_loss': g_loss.item(),
+                'd_loss': d_loss.item(),
+                'g_loss_adv': g_loss_adv.item(),
+                'l1_loss': l1_loss.item(),
+                'ssim_loss': ssim_loss_val.item(),
+                'grad_loss': grad_loss_val.item()
+            }
+            logger.log_batch(epoch, batch_idx, batch_metrics, batch_time)
         
         # Update batch progress bar with current losses
         batch_pbar.set_postfix({
             'G_loss': f'{g_loss.item():.4f}',
             'D_loss': f'{d_loss.item():.4f}',
+            'G_adv': f'{g_loss_adv.item():.4f}',
+            'L1': f'{l1_loss.item():.4f}',
             'Batch': f'{batch_idx+1}/{len(loader)}'
         })
     
-    return g_l/len(loader), d_l/len(loader)
+    # Return detailed epoch-level metrics
+    num_batches = len(loader)
+    return {
+        'g_loss': total_g_loss / num_batches,
+        'd_loss': total_d_loss / num_batches,
+        'g_loss_adv': total_g_loss_adv / num_batches,
+        'l1_loss': total_l1_loss / num_batches,
+        'ssim_loss': total_ssim_loss / num_batches,
+        'grad_loss': total_grad_loss / num_batches
+    }
 
 # -------------------------------
 #  CLI
@@ -1110,6 +1270,13 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     print("="*60)
     print("Multi-Scale U-Net for RGB to NIR Image Translation")
     print("="*60)
+    
+    # Initialize logger
+    run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    logger = TrainingLogger(output_dir, run_name)
+    print(f"Logging training metrics to:")
+    for log_name, log_path in logger.get_log_paths().items():
+        print(f"  {log_name}: {log_path}")
     
     # Set up and validate data directory
     try:
@@ -1269,21 +1436,31 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     best_val_loss = float('inf')
     
     for e in epoch_pbar:
+        import time
+        epoch_start_time = time.time()
+        
         # Training phase
         G.train()
         D.train()
-        gl, dl = train_epoch(
+        train_metrics = train_epoch(
             G, D, train_loader, og, od, device, 
             lambda_l1=args.lambda_l1, 
             lambda_ssim=args.lambda_ssim, 
-            lambda_grad=args.lambda_grad
+            lambda_grad=args.lambda_grad,
+            logger=logger,
+            epoch=e
         )
         
         # Validation phase
         G.eval()
         D.eval()
-        val_g_loss = 0.0
-        val_ssim_score = 0.0
+        val_metrics = {
+            'val_loss': 0.0,
+            'val_l1': 0.0,
+            'val_ssim': 0.0,
+            'val_grad': 0.0,
+            'val_ssim_score': 0.0
+        }
         
         with torch.no_grad():
             for rgb, nir in val_loader:
@@ -1293,33 +1470,53 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
                 # Calculate validation losses
                 l1_loss = F.l1_loss(fake, nir)
                 ssim_score = ssim(fake, nir)
-                grad_loss = gradient_loss(fake, nir)
+                grad_loss_val = gradient_loss(fake, nir)
                 
                 # Composite loss - same weighting as training
                 val_loss = (args.lambda_l1 * l1_loss + 
                           args.lambda_ssim * (1 - ssim_score) + 
-                          args.lambda_grad * grad_loss)
+                          args.lambda_grad * grad_loss_val)
                 
-                val_g_loss += val_loss.item()
-                val_ssim_score += ssim_score.item()
+                val_metrics['val_loss'] += val_loss.item()
+                val_metrics['val_l1'] += l1_loss.item()
+                val_metrics['val_ssim'] += (1 - ssim_score).item()
+                val_metrics['val_grad'] += grad_loss_val.item()
+                val_metrics['val_ssim_score'] += ssim_score.item()
         
-        val_g_loss /= len(val_loader)
-        val_ssim_score /= len(val_loader)
+        # Average validation metrics
+        for key in val_metrics:
+            val_metrics[key] /= len(val_loader)
         
-        is_best = val_g_loss < best_val_loss
+        # Calculate epoch time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Check if this is the best epoch
+        is_best = val_metrics['val_loss'] < best_val_loss
         if is_best:
-            best_val_loss = val_g_loss
+            best_val_loss = val_metrics['val_loss']
+        
+        # Log epoch metrics
+        logger.log_epoch(
+            epoch=e,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+            is_best=is_best,
+            epoch_time=epoch_time,
+            lr=args.lr
+        )
         
         # Update epoch progress bar with losses
         epoch_pbar.set_postfix({
-            'G_loss': f'{gl:.4f}',
-            'D_loss': f'{dl:.4f}',
-            'Val_loss': f'{val_g_loss:.4f}',
-            'Val_SSIM': f'{val_ssim_score:.4f}'
+            'G_loss': f'{train_metrics["g_loss"]:.4f}',
+            'D_loss': f'{train_metrics["d_loss"]:.4f}',
+            'Val_loss': f'{val_metrics["val_loss"]:.4f}',
+            'Val_SSIM': f'{val_metrics["val_ssim_score"]:.4f}'
         })
         
         # Print epoch summary
-        print(f"Epoch {e:03d}/{args.epochs:03d} | Train G={gl:.4f} D={dl:.4f} | Val loss={val_g_loss:.4f} SSIM={val_ssim_score:.4f}")
+        print(f"Epoch {e:03d}/{args.epochs:03d} | Train G={train_metrics['g_loss']:.4f} D={train_metrics['d_loss']:.4f} | "
+              f"Val loss={val_metrics['val_loss']:.4f} SSIM={val_metrics['val_ssim_score']:.4f} | "
+              f"Time: {epoch_time/60:.1f}min")
         
         # Save checkpoint
         if e % args.save_freq == 0 or e == args.epochs or is_best:
@@ -1336,8 +1533,8 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
                 'discriminator_state_dict': D.state_dict(),
                 'optimizer_g_state_dict': og.state_dict(),
                 'optimizer_d_state_dict': od.state_dict(),
-                'val_loss': val_g_loss,
-                'val_ssim': val_ssim_score,
+                'val_loss': val_metrics['val_loss'],
+                'val_ssim': val_metrics['val_ssim_score'],
                 'is_best': is_best,
                 'args': args,
                 'validation_result': validation_result
@@ -1351,8 +1548,8 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
                     'discriminator_state_dict': D.state_dict(),
                     'optimizer_g_state_dict': og.state_dict(),
                     'optimizer_d_state_dict': od.state_dict(),
-                    'val_loss': val_g_loss,
-                    'val_ssim': val_ssim_score,
+                    'val_loss': val_metrics['val_loss'],
+                    'val_ssim': val_metrics['val_ssim_score'],
                     'args': args,
                     'validation_result': validation_result
                 }, best_path)
