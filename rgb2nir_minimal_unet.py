@@ -112,6 +112,8 @@ from typing import List, Tuple
 import os
 import random
 import csv
+import time
+import warnings
 from datetime import datetime
 
 import torch
@@ -122,6 +124,22 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 
+# Hyperparameter optimization and experiment tracking
+try:
+    import optuna
+    from optuna.integration import WeightsBiasesCallback
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+    print("Warning: Optuna not available. Install with: pip install optuna")
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: Weights & Biases not available. Install with: pip install wandb")
+
 # Import utility functions for directory organization
 try:
     from utils import organize_image_directory, create_processed_subdirectories
@@ -129,6 +147,305 @@ try:
 except ImportError:
     UTILS_AVAILABLE = False
     print("Warning: utils.py not found. Directory organization features disabled.")
+
+# -------------------------------
+#  Hyperparameter Optimization with Optuna
+# -------------------------------
+class OptunaTuner:
+    """
+    Optuna-based hyperparameter optimization for RGB-to-NIR GAN training.
+    
+    Optimizes key hyperparameters including:
+    - Learning rates for generator and discriminator
+    - Loss function weights (λ_L1, λ_SSIM, λ_grad)
+    - Model architecture parameters
+    - Training parameters (batch size, etc.)
+    """
+    
+    def __init__(self, data_root, output_dir, n_trials=50, study_name=None):
+        self.data_root = Path(data_root)
+        self.output_dir = Path(output_dir)
+        self.n_trials = n_trials
+        self.study_name = study_name or f"rgb2nir_study_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Fixed parameters (can be made configurable)
+        self.fixed_params = {
+            'size': 512,
+            'epochs': 30,  # Shorter epochs for tuning
+            'test_size': 0.1,
+            'val_size': 0.1,
+            'seed': 42,
+            'save_freq': 10
+        }
+        
+        # Best trial tracking
+        self.best_trial = None
+        self.best_score = float('inf')
+        
+    def suggest_hyperparameters(self, trial):
+        """Suggest hyperparameters for the current trial"""
+        # Learning rates
+        lr_g = trial.suggest_float('lr_g', 1e-5, 1e-3, log=True)
+        lr_d = trial.suggest_float('lr_d', 1e-5, 1e-3, log=True)
+        
+        # Loss weights
+        lambda_l1 = trial.suggest_float('lambda_l1', 10.0, 200.0)
+        lambda_ssim = trial.suggest_float('lambda_ssim', 1.0, 50.0)
+        lambda_grad = trial.suggest_float('lambda_grad', 1.0, 50.0)
+        
+        # Model architecture
+        base_channels = trial.suggest_categorical('base_channels', [32, 64, 128])
+        
+        # Training parameters
+        batch_size = trial.suggest_categorical('batch_size', [4, 8, 16, 32])
+        
+        # Beta parameters for Adam optimizer
+        beta1 = trial.suggest_float('beta1', 0.1, 0.9)
+        beta2 = trial.suggest_float('beta2', 0.9, 0.999)
+        
+        return {
+            'lr_g': lr_g,
+            'lr_d': lr_d,
+            'lambda_l1': lambda_l1,
+            'lambda_ssim': lambda_ssim,
+            'lambda_grad': lambda_grad,
+            'base_channels': base_channels,
+            'batch_size': batch_size,
+            'beta1': beta1,
+            'beta2': beta2,
+            **self.fixed_params
+        }
+    
+    def objective(self, trial):
+        """Objective function for Optuna optimization"""
+        # Get hyperparameters for this trial
+        params = self.suggest_hyperparameters(trial)
+        
+        # Initialize W&B for this trial if available
+        if WANDB_AVAILABLE:
+            wandb.init(
+                project="rgb2nir-tuning",
+                name=f"trial_{trial.number}",
+                config=params,
+                reinit=True
+            )
+        
+        try:
+            # Run training with suggested parameters
+            score = self._train_with_params(trial, params)
+            
+            # Log to W&B
+            if WANDB_AVAILABLE:
+                wandb.log({"final_validation_loss": score})
+                wandb.finish()
+            
+            # Update best trial
+            if score < self.best_score:
+                self.best_score = score
+                self.best_trial = trial.number
+                
+            return score
+            
+        except Exception as e:
+            print(f"Trial {trial.number} failed: {e}")
+            if WANDB_AVAILABLE:
+                wandb.finish()
+            # Return a high loss for failed trials
+            return float('inf')
+    
+    def _train_with_params(self, trial, params):
+        """Train model with given parameters and return validation loss"""
+        # Set up device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Validate data structure
+        validation_result = validate_data_structure(self.data_root, verbose=False)
+        if not validation_result['valid']:
+            raise ValueError("Data validation failed")
+        
+        # Create dataset
+        full_dataset = PairedRGBNIR(
+            self.data_root,
+            size=params['size'],
+            rgb_subdir=validation_result.get('rgb_subdir'),
+            nir_subdir=validation_result.get('nir_subdir')
+        )
+        
+        # Split dataset
+        torch.manual_seed(params['seed'])
+        random.seed(params['seed'])
+        
+        dataset_size = len(full_dataset)
+        test_size = int(dataset_size * params['test_size'])
+        val_size = int(dataset_size * params['val_size'])
+        train_size = dataset_size - test_size - val_size
+        
+        train_dataset, val_dataset, _ = random_split(
+            full_dataset, [train_size, val_size, test_size]
+        )
+        
+        # Create data loaders
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=params['batch_size'],
+            shuffle=True,
+            pin_memory=True,
+            num_workers=0
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=params['batch_size'],
+            shuffle=False,
+            pin_memory=True,
+            num_workers=0
+        )
+        
+        # Initialize models
+        G = GeneratorUNet(base=params['base_channels']).to(device)
+        D = MultiScaleDiscriminator(use_spectral_norm=True).to(device)
+        
+        # Optimizers with suggested parameters
+        og = torch.optim.Adam(
+            G.parameters(),
+            lr=params['lr_g'],
+            betas=(params['beta1'], params['beta2'])
+        )
+        od = torch.optim.Adam(
+            D.parameters(),
+            lr=params['lr_d'],
+            betas=(params['beta1'], params['beta2'])
+        )
+        
+        # Training loop
+        best_val_loss = float('inf')
+        patience = 5  # Early stopping
+        patience_counter = 0
+        
+        for epoch in range(1, params['epochs'] + 1):
+            # Training phase
+            G.train()
+            D.train()
+            train_metrics = train_epoch(
+                G, D, train_loader, og, od, device,
+                lambda_l1=params['lambda_l1'],
+                lambda_ssim=params['lambda_ssim'],
+                lambda_grad=params['lambda_grad']
+            )
+            
+            # Validation phase
+            G.eval()
+            D.eval()
+            val_loss = 0.0
+            val_ssim_score = 0.0
+            
+            with torch.no_grad():
+                for rgb, nir in val_loader:
+                    rgb, nir = rgb.to(device), nir.to(device)
+                    fake = G(rgb)
+                    
+                    l1_loss = F.l1_loss(fake, nir)
+                    ssim_score = ssim(fake, nir)
+                    grad_loss_val = gradient_loss(fake, nir)
+                    
+                    val_loss += (params['lambda_l1'] * l1_loss +
+                                params['lambda_ssim'] * (1 - ssim_score) +
+                                params['lambda_grad'] * grad_loss_val).item()
+                    val_ssim_score += ssim_score.item()
+            
+            val_loss /= len(val_loader)
+            val_ssim_score /= len(val_loader)
+            
+            # Report intermediate value for pruning
+            trial.report(val_loss, epoch)
+            
+            # Check if trial should be pruned
+            if trial.should_prune():
+                raise optuna.exceptions.TrialPruned()
+            
+            # Log to W&B
+            if WANDB_AVAILABLE:
+                wandb.log({
+                    'epoch': epoch,
+                    'train_g_loss': train_metrics['g_loss'],
+                    'train_d_loss': train_metrics['d_loss'],
+                    'val_loss': val_loss,
+                    'val_ssim': val_ssim_score,
+                    'lr_g': params['lr_g'],
+                    'lr_d': params['lr_d']
+                })
+            
+            # Early stopping
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+        
+        return best_val_loss
+    
+    def optimize(self, direction='minimize'):
+        """Run hyperparameter optimization"""
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for hyperparameter optimization")
+        
+        # Create study
+        study = optuna.create_study(
+            direction=direction,
+            study_name=self.study_name,
+            pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10)
+        )
+        
+        # Set up W&B callback if available
+        callbacks = []
+        if WANDB_AVAILABLE:
+            wandb_callback = WeightsBiasesCallback(
+                metric_name="validation_loss",
+                wandb_kwargs={
+                    "project": "rgb2nir-optimization",
+                    "name": self.study_name
+                }
+            )
+            callbacks.append(wandb_callback)
+        
+        print(f"Starting hyperparameter optimization with {self.n_trials} trials...")
+        print(f"Study name: {self.study_name}")
+        
+        # Run optimization
+        study.optimize(
+            self.objective,
+            n_trials=self.n_trials,
+            callbacks=callbacks,
+            show_progress_bar=True
+        )
+        
+        # Print results
+        print("\nOptimization completed!")
+        print(f"Best trial: {study.best_trial.number}")
+        print(f"Best validation loss: {study.best_value:.6f}")
+        print("\nBest hyperparameters:")
+        for key, value in study.best_trial.params.items():
+            print(f"  {key}: {value}")
+        
+        # Save results
+        results_file = self.output_dir / f'optuna_results_{self.study_name}.txt'
+        with open(results_file, 'w') as f:
+            f.write(f"Optuna Hyperparameter Optimization Results\n")
+            f.write(f"==========================================\n\n")
+            f.write(f"Study name: {self.study_name}\n")
+            f.write(f"Number of trials: {len(study.trials)}\n")
+            f.write(f"Best trial: {study.best_trial.number}\n")
+            f.write(f"Best validation loss: {study.best_value:.6f}\n\n")
+            f.write("Best hyperparameters:\n")
+            for key, value in study.best_trial.params.items():
+                f.write(f"  {key}: {value}\n")
+        
+        print(f"Results saved to: {results_file}")
+        
+        return study.best_trial.params, study.best_value
 
 # -------------------------------
 #  Training Logger for Loss Tracking
@@ -139,10 +456,12 @@ class TrainingLogger:
     
     Logs per-epoch metrics to CSV files for later analysis and plotting.
     Tracks generator losses, discriminator losses, validation metrics, and timing.
+    Integrates with Weights & Biases for experiment tracking.
     """
-    def __init__(self, output_dir: Path, run_name: str = None):
+    def __init__(self, output_dir: Path, run_name: str = None, use_wandb: bool = False, wandb_project: str = "rgb2nir"):
         self.output_dir = output_dir
         self.run_name = run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.use_wandb = use_wandb and WANDB_AVAILABLE
         
         # Create logs directory
         self.logs_dir = output_dir / 'logs'
@@ -157,6 +476,19 @@ class TrainingLogger:
         
         # In-memory storage for current epoch
         self.current_epoch_batches = []
+        
+        # Initialize W&B if requested
+        if self.use_wandb:
+            try:
+                wandb.init(
+                    project=wandb_project,
+                    name=self.run_name,
+                    reinit=True
+                )
+                print(f"Weights & Biases tracking initialized: {wandb.run.url}")
+            except Exception as e:
+                print(f"Warning: Failed to initialize W&B: {e}")
+                self.use_wandb = False
         
     def _init_csv_files(self):
         """Initialize CSV files with appropriate headers"""
@@ -207,9 +539,15 @@ class TrainingLogger:
                 batch_data['d_loss'], batch_data['g_loss_adv'], batch_data['l1_loss'],
                 batch_data['ssim_loss'], batch_data['grad_loss'], batch_data['batch_time_seconds']
             ])
+        
+        # Log to W&B (optional, can be noisy)
+        if self.use_wandb and batch_idx % 10 == 0:  # Log every 10th batch
+            wandb_metrics = {f"batch/{k}": v for k, v in batch_data.items() if k not in ['epoch', 'batch']}
+            wandb_metrics['batch/step'] = epoch * 1000 + batch_idx  # Unique step
+            wandb.log(wandb_metrics)
     
     def log_epoch(self, epoch: int, train_metrics: dict, val_metrics: dict, 
-                  is_best: bool, epoch_time: float, lr: float):
+                  is_best: bool, epoch_time: float, lr: float, extra_metrics: dict = None):
         """Log metrics for a complete epoch"""
         timestamp = datetime.now().isoformat()
         
@@ -237,12 +575,53 @@ class TrainingLogger:
             writer = csv.writer(f)
             writer.writerow(epoch_data)
         
+        # Log to W&B
+        if self.use_wandb:
+            wandb_metrics = {
+                'epoch': epoch,
+                'train/generator_loss': train_metrics.get('g_loss', 0),
+                'train/discriminator_loss': train_metrics.get('d_loss', 0),
+                'train/g_loss_adv': avg_g_loss_adv,
+                'train/l1_loss': avg_l1_loss,
+                'train/ssim_loss': avg_ssim_loss,
+                'train/grad_loss': avg_grad_loss,
+                'val/total_loss': val_metrics.get('val_loss', 0),
+                'val/l1_loss': val_metrics.get('val_l1', 0),
+                'val/ssim_loss': val_metrics.get('val_ssim', 0),
+                'val/grad_loss': val_metrics.get('val_grad', 0),
+                'val/ssim_score': val_metrics.get('val_ssim_score', 0),
+                'training/learning_rate': lr,
+                'training/epoch_time_minutes': epoch_time / 60.0,
+                'training/is_best_epoch': is_best
+            }
+            
+            # Add extra metrics if provided
+            if extra_metrics:
+                wandb_metrics.update(extra_metrics)
+            
+            wandb.log(wandb_metrics, step=epoch)
+        
         # Clear batch data for next epoch
         self.current_epoch_batches = []
         
         # Print summary
         print(f"Logged epoch {epoch} - G: {train_metrics.get('g_loss', 0):.4f}, "
               f"D: {train_metrics.get('d_loss', 0):.4f}, Val: {val_metrics.get('val_loss', 0):.4f}")
+    
+    def log_hyperparameters(self, hyperparams: dict):
+        """Log hyperparameters to W&B"""
+        if self.use_wandb:
+            wandb.config.update(hyperparams)
+    
+    def log_model_architecture(self, model_summary: str):
+        """Log model architecture summary"""
+        if self.use_wandb:
+            wandb.config.update({"model_summary": model_summary})
+    
+    def finish(self):
+        """Finish W&B run"""
+        if self.use_wandb:
+            wandb.finish()
     
     def get_log_paths(self):
         """Return paths to the log files for user reference"""
@@ -1261,6 +1640,22 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     parser.add_argument('--base_channels', type=int, default=64,
                        help='Base number of channels in U-Net')
     
+    # Hyperparameter optimization options
+    parser.add_argument('--tune', action='store_true',
+                       help='Run hyperparameter optimization with Optuna')
+    parser.add_argument('--n_trials', type=int, default=50,
+                       help='Number of Optuna trials for hyperparameter tuning')
+    parser.add_argument('--study_name', type=str, default=None,
+                       help='Name for Optuna study (auto-generated if not provided)')
+    parser.add_argument('--use_wandb', action='store_true',
+                       help='Enable Weights & Biases experiment tracking')
+    parser.add_argument('--wandb_project', type=str, default='rgb2nir',
+                       help='Weights & Biases project name')
+    
+    # Training from optimized hyperparameters
+    parser.add_argument('--use_best_params', type=str, default=None,
+                       help='Path to best hyperparameters file from Optuna tuning')
+    
     args = parser.parse_args()
 
     # Set up output directory
@@ -1271,9 +1666,68 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     print("Multi-Scale U-Net for RGB to NIR Image Translation")
     print("="*60)
     
+    # Handle hyperparameter optimization
+    if args.tune:
+        if not OPTUNA_AVAILABLE:
+            print("ERROR: Optuna is required for hyperparameter tuning")
+            print("Install with: pip install optuna")
+            return 1
+        
+        print("🔧 HYPERPARAMETER OPTIMIZATION MODE")
+        print("="*60)
+        
+        tuner = OptunaTuner(
+            data_root=args.data_root,
+            output_dir=output_dir,
+            n_trials=args.n_trials,
+            study_name=args.study_name
+        )
+        
+        try:
+            best_params, best_score = tuner.optimize()
+            
+            # Save best parameters for future use
+            best_params_file = output_dir / 'best_hyperparams.json'
+            import json
+            with open(best_params_file, 'w') as f:
+                json.dump(best_params, f, indent=2)
+            
+            print(f"\nBest hyperparameters saved to: {best_params_file}")
+            print("\nTo train with these parameters, use:")
+            print(f"python {__file__} --use_best_params {best_params_file} --data_root {args.data_root}")
+            
+            return 0
+            
+        except Exception as e:
+            print(f"ERROR during hyperparameter optimization: {e}")
+            return 1
+    
+    # Load best hyperparameters if specified
+    if args.use_best_params:
+        import json
+        try:
+            with open(args.use_best_params, 'r') as f:
+                best_params = json.load(f)
+            
+            print(f"Loading best hyperparameters from: {args.use_best_params}")
+            
+            # Override command line arguments with best parameters
+            for key, value in best_params.items():
+                if hasattr(args, key):
+                    setattr(args, key, value)
+                    print(f"  {key}: {value}")
+        except Exception as e:
+            print(f"ERROR loading best parameters: {e}")
+            return 1
+    
     # Initialize logger
     run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    logger = TrainingLogger(output_dir, run_name)
+    logger = TrainingLogger(
+        output_dir, 
+        run_name, 
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project
+    )
     print(f"Logging training metrics to:")
     for log_name, log_path in logger.get_log_paths().items():
         print(f"  {log_name}: {log_path}")
@@ -1380,9 +1834,31 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     G = GeneratorUNet(base=args.base_channels).to(device)
     D = MultiScaleDiscriminator(use_spectral_norm=True).to(device)
     
-    # Optimizers
-    og = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(0.5, 0.999))
-    od = torch.optim.Adam(D.parameters(), lr=args.lr, betas=(0.5, 0.999))
+    # Optimizers (support different LRs if loaded from best params)
+    lr_g = getattr(args, 'lr_g', args.lr)
+    lr_d = getattr(args, 'lr_d', args.lr)
+    beta1 = getattr(args, 'beta1', 0.5)
+    beta2 = getattr(args, 'beta2', 0.999)
+    
+    og = torch.optim.Adam(G.parameters(), lr=lr_g, betas=(beta1, beta2))
+    od = torch.optim.Adam(D.parameters(), lr=lr_d, betas=(beta1, beta2))
+    
+    # Log hyperparameters to W&B
+    if logger.use_wandb:
+        hyperparams = {
+            'lr_g': lr_g,
+            'lr_d': lr_d,
+            'lambda_l1': args.lambda_l1,
+            'lambda_ssim': args.lambda_ssim,
+            'lambda_grad': args.lambda_grad,
+            'base_channels': args.base_channels,
+            'batch_size': args.batch,
+            'beta1': beta1,
+            'beta2': beta2,
+            'size': args.size,
+            'epochs': args.epochs
+        }
+        logger.log_hyperparameters(hyperparams)
     
     # Initialize training state
     start_epoch = 1
@@ -1496,13 +1972,20 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
             best_val_loss = val_metrics['val_loss']
         
         # Log epoch metrics
+        extra_metrics = {
+            'model/g_parameters': sum(p.numel() for p in G.parameters()),
+            'model/d_parameters': sum(p.numel() for p in D.parameters()),
+            'training/g_d_ratio': train_metrics['g_loss'] / train_metrics['d_loss'] if train_metrics['d_loss'] > 0 else 0
+        }
+        
         logger.log_epoch(
             epoch=e,
             train_metrics=train_metrics,
             val_metrics=val_metrics,
             is_best=is_best,
             epoch_time=epoch_time,
-            lr=args.lr
+            lr=lr_g,  # Use generator learning rate
+            extra_metrics=extra_metrics
         )
         
         # Update epoch progress bar with losses
@@ -1600,6 +2083,10 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
             f.write(f"{metric}: {value:.6f}\n")
     
     print(f"Test results saved to {results_path}")
+    
+    # Finish W&B logging
+    logger.finish()
+    
     return 0
 
 
