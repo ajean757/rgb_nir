@@ -407,7 +407,7 @@ class OptunaTuner:
         # Set up W&B callback if available
         callbacks = []
         if WANDB_AVAILABLE:
-            wandb_callback = WeightsBiasesCallback(
+            wandb_callback = WandbCallback(
                 metric_name="validation_loss",
                 wandb_kwargs={
                     "project": "rgb2nir-optimization",
