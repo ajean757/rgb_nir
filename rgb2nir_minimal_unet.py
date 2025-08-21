@@ -127,7 +127,12 @@ from tqdm import tqdm
 # Hyperparameter optimization and experiment tracking
 try:
     import optuna
-    from optuna.integration import WeightsBiasesCallback
+    # Try Optuna’s built-in integration first (older versions)
+    try:
+        from optuna.integration import WandbCallback
+    except Exception:
+        # Newer: integration moved to a separate package with a new class name
+        from optuna_integration.wandb import WeightsAndBiasesCallback as WandbCallback
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
