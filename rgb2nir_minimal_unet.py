@@ -406,15 +406,20 @@ class OptunaTuner:
         
         # Set up W&B callback if available
         callbacks = []
-        if WANDB_AVAILABLE:
-            wandb_callback = WandbCallback(
-                metric_name="validation_loss",
-                wandb_kwargs={
-                    "project": "rgb2nir-optimization",
-                    "name": self.study_name
-                }
-            )
-            callbacks.append(wandb_callback)
+        if WANDB_AVAILABLE and 'WandbCallback' in globals():
+            try:
+                wandb_callback = WandbCallback(
+                    metric_name="validation_loss",
+                    wandb_kwargs={
+                        "project": "rgb2nir-optimization",
+                        "name": self.study_name
+                    }
+                )
+                callbacks.append(wandb_callback)
+                print("W&B integration enabled for optimization tracking")
+            except Exception as e:
+                print(f"Warning: Could not set up W&B callback: {e}")
+                print("Continuing with manual W&B logging")
         
         print(f"Starting hyperparameter optimization with {self.n_trials} trials...")
         print(f"Study name: {self.study_name}")
@@ -485,12 +490,16 @@ class TrainingLogger:
         # Initialize W&B if requested
         if self.use_wandb:
             try:
-                wandb.init(
-                    project=wandb_project,
-                    name=self.run_name,
-                    reinit=True
-                )
-                print(f"Weights & Biases tracking initialized: {wandb.run.url}")
+                # Check if W&B is already initialized (e.g., by sweep auto-detection)
+                if hasattr(wandb, 'run') and wandb.run is not None:
+                    print(f"✅ Using existing W&B run: {wandb.run.url}")
+                else:
+                    wandb.init(
+                        project=wandb_project,
+                        name=self.run_name,
+                        reinit=True
+                    )
+                    print(f"✅ Weights & Biases tracking initialized: {wandb.run.url}")
             except Exception as e:
                 print(f"Warning: Failed to initialize W&B: {e}")
                 self.use_wandb = False
@@ -1616,6 +1625,16 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     
+    # Adam optimizer parameters
+    parser.add_argument('--beta1', type=float, default=0.5, 
+                       help='Beta1 parameter for Adam optimizer (momentum)')
+    parser.add_argument('--beta2', type=float, default=0.999, 
+                       help='Beta2 parameter for Adam optimizer (RMSprop)')
+    parser.add_argument('--lr_g', type=float, 
+                       help='Generator learning rate (defaults to --lr if not specified)')
+    parser.add_argument('--lr_d', type=float, 
+                       help='Discriminator learning rate (defaults to --lr if not specified)')
+    
     # Loss weights for ablation studies
     parser.add_argument('--lambda_l1', type=float, default=100.0, 
                        help='L1 loss weight (pixel-wise reconstruction)')
@@ -1662,6 +1681,38 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
                        help='Path to best hyperparameters file from Optuna tuning')
     
     args = parser.parse_args()
+
+    # 🔍 AUTO-DETECT W&B SWEEP MODE
+    # Check if we're running in a W&B sweep environment
+    in_sweep = False
+    try:
+        import wandb
+        # Check for W&B environment variables that indicate we're in a sweep
+        import os
+        if (os.getenv('WANDB_SWEEP_ID') or 
+            os.getenv('WANDB_RUN_ID') or 
+            any('sweep' in str(v).lower() for v in os.environ.values() if 'wandb' in str(v).lower())):
+            
+            print("🔍 W&B Sweep detected! Auto-enabling W&B logging...")
+            args.use_wandb = True
+            in_sweep = True
+            
+            # Initialize W&B early to get sweep config
+            wandb.init()
+            
+            # Override args with sweep config if available
+            if hasattr(wandb.config, 'keys') and len(wandb.config.keys()) > 0:
+                print("📝 Updating parameters from sweep config:")
+                for key in wandb.config.keys():
+                    if hasattr(args, key):
+                        old_value = getattr(args, key)
+                        new_value = wandb.config[key]
+                        setattr(args, key, new_value)
+                        print(f"  {key}: {old_value} → {new_value}")
+    except ImportError:
+        print("Note: wandb not available, skipping sweep detection")
+    except Exception as e:
+        print(f"Note: Could not detect W&B sweep: {e}")
 
     # Set up output directory
     output_dir = Path(args.output_dir)
@@ -1840,10 +1891,10 @@ python rgb2nir_minimal_unet.py --data_root /path/to/final --size 1024 --batch 4
     D = MultiScaleDiscriminator(use_spectral_norm=True).to(device)
     
     # Optimizers (support different LRs if loaded from best params)
-    lr_g = getattr(args, 'lr_g', args.lr)
-    lr_d = getattr(args, 'lr_d', args.lr)
-    beta1 = getattr(args, 'beta1', 0.5)
-    beta2 = getattr(args, 'beta2', 0.999)
+    lr_g = args.lr_g if args.lr_g is not None else args.lr
+    lr_d = args.lr_d if args.lr_d is not None else args.lr
+    beta1 = args.beta1
+    beta2 = args.beta2
     
     og = torch.optim.Adam(G.parameters(), lr=lr_g, betas=(beta1, beta2))
     od = torch.optim.Adam(D.parameters(), lr=lr_d, betas=(beta1, beta2))
