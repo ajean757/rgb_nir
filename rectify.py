@@ -26,8 +26,17 @@ python rectify.py --save-all
 # Save specific intermediate images
 python rectify.py --save-overlay --save-aerochrome
 
-# With custom options and save all
-python rectify.py --input ./DATA/data_04_06_2025 --ext dng --debug --save-all
+# With custom input/output directories and save all
+python rectify.py --input ./DATA/data_04_06_2025 --output ./results --ext dng --debug --save-all
+
+# Use custom output directory
+python rectify.py --input ../data/raw-data/ --output ./processed_images --save-all
+
+# Use custom gamma correction (linear = 1.0, darker = higher values)
+python rectify.py --gamma 1.8 --save-all
+
+# Disable automatic brightness adjustment in RGB processing
+python rectify.py --no-auto-bright --save-all
 
 # Disable ANMS
 python rectify.py --no-anms
@@ -65,6 +74,10 @@ class ProcessingOptions:
     dng_enhance_contrast: bool = True
     dng_brightness: float = 1.2
     dng_exposure_shift: float = 0.3
+    # Gamma correction options
+    gamma_value: float = 2.2  # Gamma correction value for tone mapping
+    # RGB processing options
+    rgb_no_auto_bright: bool = False  # Disable automatic brightness adjustment (default: False = auto brightness enabled)
     # Cropping options
     crop_to_valid_region: bool = True  # Enable cropping to remove black borders
     crop_preserve_ratio: float = 0.92  # Preserve at least 92% of pixels when cropping
@@ -95,11 +108,10 @@ class ImageLoader:
             RGB image in [0,1] float32 format, shape (H, W, 3)
         """
         with rawpy.imread(dng_path) as raw:
-            # Process with gamma correction for better feature detection
-            # Using gamma=2.2 instead of linear for improved contrast
+            # Process in linear space first for consistent processing with NIR
             rgb = raw.postprocess(
-                gamma=(1, 1),  # Apply gamma correction for better contrast
-                no_auto_bright=False,  # Allow auto brightness for better feature detection
+                gamma=(1, 1),  # Keep linear for consistent processing with NIR
+                no_auto_bright=self.options.rgb_no_auto_bright,  # Configurable auto brightness
                 output_bps=16,
                 use_camera_wb=True,
                 bright=self.options.dng_brightness,  # Configurable brightness
@@ -111,6 +123,9 @@ class ImageLoader:
             # Apply histogram stretching for better contrast if enabled
             if self.options.dng_enhance_contrast:
                 rgb = self._enhance_contrast(rgb)
+            
+            # Apply gamma correction for proper tone mapping (matches NIR processing)
+            rgb = self._apply_gamma_correction(rgb, gamma=self.options.gamma_value)
 
             # Convert from RGB to BGR for OpenCV
             rgb = rgb[..., ::-1]
@@ -144,6 +159,9 @@ class ImageLoader:
             # Apply contrast enhancement for better feature detection if enabled
             if self.options.dng_enhance_contrast:
                 nir_raw = self._enhance_contrast_single_channel(nir_raw)
+
+            # Apply gamma correction for proper tone mapping (matches RGB processing)
+            nir_raw = self._apply_gamma_correction(nir_raw, gamma=self.options.gamma_value)
 
             # Convert to 3-channel for compatibility with OpenCV operations
             nir_bgr = cv2.merge([nir_raw, nir_raw, nir_raw])
@@ -283,6 +301,28 @@ class ImageLoader:
             return np.clip(img_stretched, 0, 1)
         else:
             return img
+
+    def _apply_gamma_correction(self, img: np.ndarray, gamma: float = 2.2) -> np.ndarray:
+        """
+        Apply gamma correction to linear image data for proper tone mapping.
+        
+        This converts linear sensor data to gamma-corrected sRGB-like representation
+        for better visual appearance and feature detection.
+        
+        Args:
+            img: Input image in linear [0,1] float32 format
+            gamma: Gamma value (2.2 is standard for sRGB)
+            
+        Returns:
+            Gamma-corrected image in [0,1] float32 format
+        """
+        # Ensure input is in valid range
+        img_clipped = np.clip(img, 0, 1)
+        
+        # Apply gamma correction: output = input^(1/gamma)
+        gamma_corrected = np.power(img_clipped, 1.0 / gamma)
+        
+        return gamma_corrected.astype(np.float32)
 
 class ImageSaver:
     """Handles saving images in various formats."""
@@ -1188,7 +1228,7 @@ class RGBNIRPipeline:
 
     def _load_camera_info(self, npz_path: str) -> Dict[str, Any]:
         """Load camera calibration and rectification parameters from NPZ file."""
-        return dict(np.load(npz_path))
+        return dict(np.load(npz_path, allow_pickle=True))
 
     def get_image_pairs(self, input_dir: str, file_extension: Optional[str] = None) -> List[Tuple[str, str]]:
         """
@@ -1456,6 +1496,8 @@ def main():
     parser = argparse.ArgumentParser(description="RGB-NIR Image Registration Pipeline")
     parser.add_argument('--input', type=str, default="./DATA/data_04_06_2025", 
                        help='Input directory containing image pairs')
+    parser.add_argument('--output', type=str, default=None,
+                       help='Output directory for processed images (default: INPUT/processed)')
     parser.add_argument('--npz', type=str, default="./calibration_files/calib_data7.npz",
                        help='Path to camera calibration NPZ file')
     parser.add_argument('--ext', type=str, default=None,
@@ -1485,6 +1527,10 @@ def main():
                        help='DNG brightness multiplier (default: 1.2)')
     parser.add_argument('--dng-exposure', type=float, default=0.3,
                        help='DNG exposure shift (default: 0.3)')
+    parser.add_argument('--gamma', type=float, default=2.2,
+                       help='Gamma correction value for tone mapping (default: 2.2)')
+    parser.add_argument('--no-auto-bright', action='store_true',
+                       help='Disable automatic brightness adjustment in RGB processing')
     parser.add_argument('--no-crop', action='store_true',
                        help='Disable cropping to valid region (may result in black borders)')
     parser.add_argument('--crop-preserve-ratio', type=float, default=0.92,
@@ -1569,6 +1615,8 @@ def main():
         dng_enhance_contrast=not args.no_dng_enhance,
         dng_brightness=args.dng_brightness,
         dng_exposure_shift=args.dng_exposure,
+        gamma_value=args.gamma,
+        rgb_no_auto_bright=args.no_auto_bright,
         crop_to_valid_region=not args.no_crop,
         crop_preserve_ratio=args.crop_preserve_ratio,
         # Quality control options
@@ -1586,12 +1634,13 @@ def main():
         return
 
     # Define output directories
+    output_base = args.output if args.output else f"{args.input}/processed"
     output_directories = {
-        'rectified': f"{args.input}/processed/rectified",
-        'warped': f"{args.input}/processed/warped",
-        'overlay': f"{args.input}/processed/overlay",
-        'aerochrome': f"{args.input}/processed/aerochrome",
-        'final': f"{args.input}/processed/final"
+        'rectified': f"{output_base}/rectified",
+        'warped': f"{output_base}/warped",
+        'overlay': f"{output_base}/overlay",
+        'aerochrome': f"{output_base}/aerochrome",
+        'final': f"{output_base}/final"
     }
 
     # Create and run pipeline
