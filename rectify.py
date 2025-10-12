@@ -72,10 +72,10 @@ class ProcessingOptions:
     verbose: bool = False
     # DNG enhancement options
     dng_enhance_contrast: bool = True
-    dng_brightness: float = 1.2
-    dng_exposure_shift: float = 0.3
+    dng_brightness: float = 1.0
+    dng_exposure_shift: float = 1.0
     # Gamma correction options
-    gamma_value: float = 2.2  # Gamma correction value for tone mapping
+    gamma_value: float = 1.0  # Gamma correction value for tone mapping
     # RGB processing options
     rgb_no_auto_bright: bool = False  # Disable automatic brightness adjustment (default: False = auto brightness enabled)
     # Cropping options
